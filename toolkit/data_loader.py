@@ -8,6 +8,7 @@ from typing import List, TYPE_CHECKING
 import tarfile
 import io
 import subprocess
+import uuid # Added for random renaming
 
 import cv2
 import numpy as np
@@ -22,21 +23,19 @@ import albumentations as A
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
-from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, \
-    ControlCachingMixin, TextEmbeddingCachingMixin
+from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 
 import platform
 
-
 def is_native_windows():
     return platform.system() == "Windows" and platform.release() != "2"
 
-
 if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
+    
 
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
@@ -379,8 +378,7 @@ class PairedImageDataset(Dataset):
         return img, prompt, (self.neg_weight, self.pos_weight)
 
 
-class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin,
-                       BucketsMixin, CaptionMixin, Dataset):
+class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
 
     def __init__(
             self,
@@ -432,29 +430,51 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             passphrase = os.environ.get('DATASET_PASSWORD', '')
             if not passphrase:
                 raise ValueError("DATASET_PASSWORD environment variable not set for encrypted dataset")
-
+            
             cmd = ['gpg', '--decrypt', '--batch', '--passphrase', passphrase, self.dataset_path]
             # Capture stdout to memory
             proc = subprocess.run(cmd, capture_output=True, check=True)
-
+            
             # Open tar from memory
             tar_stream = io.BytesIO(proc.stdout)
-            self.in_memory_data = {}
+            temp_data = {}
             with tarfile.open(fileobj=tar_stream, mode='r:gz') as tar:
                 for member in tar.getmembers():
                     if member.isfile():
                         f = tar.extractfile(member)
                         if f:
-                            self.in_memory_data[member.name] = f.read()
+                            temp_data[member.name] = f.read()
+            
+            # Obfuscation: Rename files to random UUIDs while preserving pairing
+            self.in_memory_data = {}
+            file_groups = {}
+            
+            # Group files by their base path (stripping extensions)
+            for filename in temp_data.keys():
+                base, ext = os.path.splitext(filename)
+                if base not in file_groups:
+                    file_groups[base] = []
+                file_groups[base].append((filename, ext))
+            
+            # Rebuild in_memory_data with random names
+            for base_key, associated_files in file_groups.items():
+                random_name = uuid.uuid4().hex
+                for original_filename, ext in associated_files:
+                    # Flatten structure: random_name + ext
+                    new_filename = f"{random_name}{ext}"
+                    self.in_memory_data[new_filename] = temp_data[original_filename]
+            
+            # Cleanup raw data
+            del temp_data
+            del proc
+            del tar_stream
 
-            # Populate file list
+            # Populate file list from new obfuscated keys
             extensions = image_extensions if not self.is_video else video_extensions
             file_list = [k for k in self.in_memory_data.keys() if k.lower().endswith(tuple(extensions))]
             file_list.sort()
-
-            # Clear raw stdout from memory
-            del proc
-            dataset_folder = ""  # virtual root
+            
+            dataset_folder = "" # virtual root
 
         # check if dataset_path is a folder or json
         elif os.path.isdir(self.dataset_path):
@@ -462,21 +482,19 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_video:
                 # only look for videos
                 extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if
-                         file.lower().endswith(tuple(extensions))]
-
+            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions))]
+            
             if not os.path.isdir(self.dataset_path):
                 dataset_folder = os.path.dirname(dataset_folder)
-
+            
             dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
             dataloader_version = "0.1.2"
             if os.path.exists(dataset_size_file):
                 try:
                     with open(dataset_size_file, 'r') as f:
                         self.size_database = json.load(f)
-
-                    if "__version__" not in self.size_database or self.size_database[
-                        "__version__"] != dataloader_version:
+                    
+                    if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
                         # print_acc("Upgrading size database to new version")
                         # old version, delete and recreate
                         self.size_database = {}
@@ -484,7 +502,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     # print_acc(f"Error loading size database: {dataset_size_file}")
                     # print_acc(e)
                     self.size_database = {}
-
+            
             self.size_database["__version__"] = dataloader_version
 
         else:
@@ -493,7 +511,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 self.caption_dict = json.load(f)
                 # keys are file paths
                 file_list = list(self.caption_dict.keys())
-
+                
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
@@ -553,7 +571,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
             with open(dataset_size_file, 'w') as f:
                 json.dump(self.size_database, f)
-
+        
         # if self.is_video:
         #     print_acc(f"  -  Found {len(self.file_list)} videos")
         #     assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
@@ -688,7 +706,7 @@ def get_dataloader_from_datasets(
     # check if is caching latents
 
     dataloader_kwargs = {}
-
+    
     if is_native_windows():
         dataloader_kwargs['num_workers'] = 0
     else:
@@ -741,7 +759,6 @@ def trigger_dataloader_setup_epoch(dataloader: DataLoader):
             if hasattr(sub_dataset, 'setup_epoch'):
                 sub_dataset.setup_epoch()
                 sub_dataset.len = None
-
 
 def get_dataloader_datasets(dataloader: DataLoader):
     # hacky but needed because of different types of datasets and dataloaders
