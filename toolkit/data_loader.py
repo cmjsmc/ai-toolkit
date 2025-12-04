@@ -5,6 +5,9 @@ import random
 import traceback
 from functools import lru_cache
 from typing import List, TYPE_CHECKING
+import tarfile
+import io
+import subprocess
 
 import cv2
 import numpy as np
@@ -19,19 +22,21 @@ import albumentations as A
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
-from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
+from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, \
+    ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 
 import platform
 
+
 def is_native_windows():
     return platform.system() == "Windows" and platform.release() != "2"
 
+
 if TYPE_CHECKING:
     from toolkit.stable_diffusion_model import StableDiffusion
-    
 
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
@@ -75,7 +80,6 @@ class NormalizeSD15Transform:
         )(image)
 
 
-
 class ImageDataset(Dataset, CaptionMixin):
     def __init__(self, config):
         self.config = config
@@ -97,7 +101,7 @@ class ImageDataset(Dataset, CaptionMixin):
                           file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
 
         # this might take a while
-        print_acc(f"  -  Preprocessing image dimensions")
+        # print_acc(f"  -  Preprocessing image dimensions")
         new_file_list = []
         bad_count = 0
         for file in tqdm(self.file_list):
@@ -114,8 +118,8 @@ class ImageDataset(Dataset, CaptionMixin):
 
         self.file_list = new_file_list
 
-        print_acc(f"  -  Found {len(self.file_list)} images")
-        print_acc(f"  -  Found {bad_count} images that are too small")
+        # print_acc(f"  -  Found {len(self.file_list)} images")
+        # print_acc(f"  -  Found {bad_count} images that are too small")
         assert len(self.file_list) > 0, f"no images found in {self.path}"
 
         self.transform = transforms.Compose([
@@ -140,8 +144,8 @@ class ImageDataset(Dataset, CaptionMixin):
         try:
             img = exif_transpose(Image.open(img_path)).convert('RGB')
         except Exception as e:
-            print_acc(f"Error opening image: {img_path}")
-            print_acc(e)
+            # print_acc(f"Error opening image: {img_path}")
+            # print_acc(e)
             # make a noise image if we can't open it
             img = Image.fromarray(np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8))
 
@@ -152,8 +156,8 @@ class ImageDataset(Dataset, CaptionMixin):
         if self.random_crop:
             if self.random_scale and min_img_size > self.resolution:
                 if min_img_size < self.resolution:
-                    print_acc(
-                        f"Unexpected values: min_img_size={min_img_size}, self.resolution={self.resolution}, image file={img_path}")
+                    # print_acc(
+                    #     f"Unexpected values: min_img_size={min_img_size}, self.resolution={self.resolution}, image file={img_path}")
                     scale_size = self.resolution
                 else:
                     scale_size = random.randint(self.resolution, int(min_img_size))
@@ -173,9 +177,6 @@ class ImageDataset(Dataset, CaptionMixin):
             return img, prompt
         else:
             return img
-
-
-
 
 
 class AugmentedImageDataset(ImageDataset):
@@ -255,11 +256,11 @@ class PairedImageDataset(Dataset):
             matched_files = [t for t in (set(tuple(i) for i in matched_files))]
 
             self.file_list = matched_files
-            print_acc(f"  -  Found {len(self.file_list)} matching pairs")
+            # print_acc(f"  -  Found {len(self.file_list)} matching pairs")
         else:
             self.file_list = [os.path.join(self.path, file) for file in os.listdir(self.path) if
                               file.lower().endswith(supported_exts)]
-            print_acc(f"  -  Found {len(self.file_list)} images")
+            # print_acc(f"  -  Found {len(self.file_list)} images")
 
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -378,7 +379,8 @@ class PairedImageDataset(Dataset):
         return img, prompt, (self.neg_weight, self.pos_weight)
 
 
-class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin, BucketsMixin, CaptionMixin, Dataset):
+class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin, TextEmbeddingCachingMixin,
+                       BucketsMixin, CaptionMixin, Dataset):
 
     def __init__(
             self,
@@ -395,6 +397,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.dataset_path = dataset_config.dataset_path
         if self.dataset_path is None:
             self.dataset_path = folder_path
+
+        self.in_memory_data = None
 
         self.is_caching_latents = dataset_config.cache_latents or dataset_config.cache_latents_to_disk
         self.is_caching_latents_to_memory = dataset_config.cache_latents
@@ -419,20 +423,77 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.caption_dict = None
         self.file_list: List['FileItemDTO'] = []
 
+        self.size_database = {}
+        dataset_folder = self.dataset_path
+
+        if self.dataset_path.endswith('.tar.gz.gpg'):
+            # Decrypt to memory without touching disk
+            # print_acc(f"Decrypting dataset: {self.dataset_path}")
+            passphrase = os.environ.get('DATASET_PASSWORD', '')
+            if not passphrase:
+                raise ValueError("DATASET_PASSWORD environment variable not set for encrypted dataset")
+
+            cmd = ['gpg', '--decrypt', '--batch', '--passphrase', passphrase, self.dataset_path]
+            # Capture stdout to memory
+            proc = subprocess.run(cmd, capture_output=True, check=True)
+
+            # Open tar from memory
+            tar_stream = io.BytesIO(proc.stdout)
+            self.in_memory_data = {}
+            with tarfile.open(fileobj=tar_stream, mode='r:gz') as tar:
+                for member in tar.getmembers():
+                    if member.isfile():
+                        f = tar.extractfile(member)
+                        if f:
+                            self.in_memory_data[member.name] = f.read()
+
+            # Populate file list
+            extensions = image_extensions if not self.is_video else video_extensions
+            file_list = [k for k in self.in_memory_data.keys() if k.lower().endswith(tuple(extensions))]
+            file_list.sort()
+
+            # Clear raw stdout from memory
+            del proc
+            dataset_folder = ""  # virtual root
+
         # check if dataset_path is a folder or json
-        if os.path.isdir(self.dataset_path):
+        elif os.path.isdir(self.dataset_path):
             extensions = image_extensions
             if self.is_video:
                 # only look for videos
                 extensions = video_extensions
-            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions))]
+            file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if
+                         file.lower().endswith(tuple(extensions))]
+
+            if not os.path.isdir(self.dataset_path):
+                dataset_folder = os.path.dirname(dataset_folder)
+
+            dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
+            dataloader_version = "0.1.2"
+            if os.path.exists(dataset_size_file):
+                try:
+                    with open(dataset_size_file, 'r') as f:
+                        self.size_database = json.load(f)
+
+                    if "__version__" not in self.size_database or self.size_database[
+                        "__version__"] != dataloader_version:
+                        # print_acc("Upgrading size database to new version")
+                        # old version, delete and recreate
+                        self.size_database = {}
+                except Exception as e:
+                    # print_acc(f"Error loading size database: {dataset_size_file}")
+                    # print_acc(e)
+                    self.size_database = {}
+
+            self.size_database["__version__"] = dataloader_version
+
         else:
             # assume json
             with open(self.dataset_path, 'r') as f:
                 self.caption_dict = json.load(f)
                 # keys are file paths
                 file_list = list(self.caption_dict.keys())
-                
+
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
@@ -458,34 +519,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             ])
 
         # this might take a while
-        print_acc(f"Dataset: {self.dataset_path}")
-        if self.is_video:
-            print_acc(f"  -  Preprocessing video dimensions")
-        else:
-            print_acc(f"  -  Preprocessing image dimensions")
-        dataset_folder = self.dataset_path
-        if not os.path.isdir(self.dataset_path):
-            dataset_folder = os.path.dirname(dataset_folder)
-        
-        dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
-        dataloader_version = "0.1.2"
-        if os.path.exists(dataset_size_file):
-            try:
-                with open(dataset_size_file, 'r') as f:
-                    self.size_database = json.load(f)
-                
-                if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
-                    print_acc("Upgrading size database to new version")
-                    # old version, delete and recreate
-                    self.size_database = {}
-            except Exception as e:
-                print_acc(f"Error loading size database: {dataset_size_file}")
-                print_acc(e)
-                self.size_database = {}
-        else:
-            self.size_database = {}
-        
-        self.size_database["__version__"] = dataloader_version
+        # print_acc(f"Dataset: {self.dataset_path}")
+        # if self.is_video:
+        #     print_acc(f"  -  Preprocessing video dimensions")
+        # else:
+        #     print_acc(f"  -  Preprocessing image dimensions")
 
         bad_count = 0
         for file in tqdm(file_list):
@@ -498,31 +536,34 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     size_database=self.size_database,
                     dataset_root=dataset_folder,
                     encode_control_in_text_embeddings=self.sd.encode_control_in_text_embeddings if self.sd else False,
+                    in_memory_data=self.in_memory_data,
                 )
                 self.file_list.append(file_item)
             except Exception as e:
-                print_acc(traceback.format_exc())
-                if self.is_video:
-                    print_acc(f"Error processing video: {file}")
-                else:
-                    print_acc(f"Error processing image: {file}")
-                print_acc(e)
+                # print_acc(traceback.format_exc())
+                # if self.is_video:
+                #     print_acc(f"Error processing video: {file}")
+                # else:
+                #     print_acc(f"Error processing image: {file}")
+                # print_acc(e)
                 bad_count += 1
 
-        # save the size database
-        with open(dataset_size_file, 'w') as f:
-            json.dump(self.size_database, f)
-        
-        if self.is_video:
-            print_acc(f"  -  Found {len(self.file_list)} videos")
-            assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
-        else:
-            print_acc(f"  -  Found {len(self.file_list)} images")
-            assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
+        # save the size database only if on disk
+        if self.in_memory_data is None and os.path.isdir(self.dataset_path):
+            dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
+            with open(dataset_size_file, 'w') as f:
+                json.dump(self.size_database, f)
+
+        # if self.is_video:
+        #     print_acc(f"  -  Found {len(self.file_list)} videos")
+        #     assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
+        # else:
+        #     print_acc(f"  -  Found {len(self.file_list)} images")
+        #     assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
 
         # handle x axis flips
         if self.dataset_config.flip_x:
-            print_acc("  -  adding x axis flips")
+            # print_acc("  -  adding x axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
                 # create a copy that is flipped on the x axis
@@ -532,7 +573,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         # handle y axis flips
         if self.dataset_config.flip_y:
-            print_acc("  -  adding y axis flips")
+            # print_acc("  -  adding y axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
                 # create a copy that is flipped on the y axis
@@ -540,11 +581,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 new_file_item.flip_y = True
                 self.file_list.append(new_file_item)
 
-        if self.dataset_config.flip_x or self.dataset_config.flip_y:
-            if self.is_video:
-                print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
-            else:
-                print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
+        # if self.dataset_config.flip_x or self.dataset_config.flip_y:
+        #     if self.is_video:
+        #         print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
+        #     else:
+        #         print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
         self.setup_epoch()
 
@@ -647,7 +688,7 @@ def get_dataloader_from_datasets(
     # check if is caching latents
 
     dataloader_kwargs = {}
-    
+
     if is_native_windows():
         dataloader_kwargs['num_workers'] = 0
     else:
@@ -700,6 +741,7 @@ def trigger_dataloader_setup_epoch(dataloader: DataLoader):
             if hasattr(sub_dataset, 'setup_epoch'):
                 sub_dataset.setup_epoch()
                 sub_dataset.len = None
+
 
 def get_dataloader_datasets(dataloader: DataLoader):
     # hacky but needed because of different types of datasets and dataloaders
