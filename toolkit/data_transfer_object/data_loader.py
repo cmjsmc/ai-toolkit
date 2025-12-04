@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Union
 import cv2
 import torch
 import random
+import io
 
 from PIL import Image
 from PIL.ImageOps import exif_transpose
@@ -13,7 +14,8 @@ from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
 from toolkit.dataloader_mixins import CaptionProcessingDTOMixin, ImageProcessingDTOMixin, LatentCachingFileItemDTOMixin, \
     ControlFileItemDTOMixin, ArgBreakMixin, PoiFileItemDTOMixin, MaskFileItemDTOMixin, AugmentationFileItemDTOMixin, \
-    UnconditionalFileItemDTOMixin, ClipImageFileItemDTOMixin, InpaintControlFileItemDTOMixin, TextEmbeddingFileItemDTOMixin
+    UnconditionalFileItemDTOMixin, ClipImageFileItemDTOMixin, InpaintControlFileItemDTOMixin, \
+    TextEmbeddingFileItemDTOMixin
 from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
 
 if TYPE_CHECKING:
@@ -24,10 +26,11 @@ printed_messages = []
 
 
 def print_once(msg):
-    global printed_messages
-    if msg not in printed_messages:
-        print(msg)
-        printed_messages.append(msg)
+    pass
+    # global printed_messages
+    # if msg not in printed_messages:
+    #     print(msg)
+    #     printed_messages.append(msg)
 
 
 class FileItemDTO(
@@ -46,59 +49,76 @@ class FileItemDTO(
 ):
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get('path', '')
+        self.in_memory_data = kwargs.get('in_memory_data', None)
         self.dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
         self.is_video = self.dataset_config.num_frames > 1
         size_database = kwargs.get('size_database', {})
-        dataset_root =  kwargs.get('dataset_root', None)
+        dataset_root = kwargs.get('dataset_root', None)
         self.encode_control_in_text_embeddings = kwargs.get('encode_control_in_text_embeddings', False)
-        if dataset_root is not None:
+
+        if dataset_root and dataset_root != "":
             # remove dataset root from path
             file_key = self.path.replace(dataset_root, '')
         else:
-            file_key = os.path.basename(self.path)
-        
-        file_signature = get_quick_signature_string(self.path)
-        if file_signature is None:
-            raise Exception("Error: Could not get file signature for {self.path}")
-        
+            file_key = self.path  # usually strict path in tar
+
         use_db_entry = False
-        if file_key in size_database:
-            db_entry = size_database[file_key]
-            if db_entry is not None and len(db_entry) >= 3 and db_entry[2] == file_signature:
-                use_db_entry = True
-        
+        if self.in_memory_data is None:
+            # Only use signature for disk files
+            file_signature = get_quick_signature_string(self.path)
+            if file_signature is None:
+                raise Exception(f"Error: Could not get file signature for {self.path}")
+
+            if file_key in size_database:
+                db_entry = size_database[file_key]
+                if db_entry is not None and len(db_entry) >= 3 and db_entry[2] == file_signature:
+                    use_db_entry = True
+        else:
+            file_signature = "in_memory"
+
         if use_db_entry:
             w, h, _ = size_database[file_key]
+        elif self.in_memory_data is not None and self.path in self.in_memory_data:
+            # Load from memory
+            img_bytes = io.BytesIO(self.in_memory_data[self.path])
+            try:
+                img = exif_transpose(Image.open(img_bytes))
+                w, h = img.size
+            except Exception as e:
+                # If cannot read, set generic size, will fail later probably
+                w, h = 1024, 1024
         elif self.is_video:
             # Open the video file
             video = cv2.VideoCapture(self.path)
-            
+
             # Check if video opened successfully
             if not video.isOpened():
                 raise Exception(f"Error: Could not open video file {self.path}")
-            
+
             # Get width and height
             width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
             w, h = width, height
-            
+
             # Release the video capture object immediately
             video.release()
-            size_database[file_key] = (width, height, file_signature)
+            if self.in_memory_data is None:
+                size_database[file_key] = (width, height, file_signature)
         else:
             if self.dataset_config.fast_image_size:
-            # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
+                # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
                 try:
                     w, h = image_utils.get_image_size(self.path)
                 except image_utils.UnknownImageFormat:
                     print_once(f'Warning: Some images in the dataset cannot be fast read. ' + \
-                            f'This process is faster for png, jpeg')
+                               f'This process is faster for png, jpeg')
                     img = exif_transpose(Image.open(self.path))
                     w, h = img.size
             else:
                 img = exif_transpose(Image.open(self.path))
                 w, h = img.size
-            size_database[file_key] = (w, h, file_signature)
+            if self.in_memory_data is None:
+                size_database[file_key] = (w, h, file_signature)
         self.width: int = w
         self.height: int = h
         self.dataloader_transforms = kwargs.get('dataloader_transforms', None)
@@ -153,7 +173,8 @@ class DataLoaderBatchDTO:
             self.clip_image_embeds: Union[List[dict], None] = None
             self.clip_image_embeds_unconditional: Union[List[dict], None] = None
             self.sigmas: Union[torch.Tensor, None] = None  # can be added elseware and passed along training code
-            self.extra_values: Union[torch.Tensor, None] = torch.tensor([x.extra_values for x in self.file_items]) if len(self.file_items[0].extra_values) > 0 else None
+            self.extra_values: Union[torch.Tensor, None] = torch.tensor(
+                [x.extra_values for x in self.file_items]) if len(self.file_items[0].extra_values) > 0 else None
             if not is_latents_cached:
                 # only return a tensor if latents are not cached
                 self.tensor: torch.Tensor = torch.cat([x.tensor.unsqueeze(0) for x in self.file_items])
@@ -178,7 +199,7 @@ class DataLoaderBatchDTO:
                     else:
                         control_tensors.append(x.control_tensor)
                 self.control_tensor = torch.cat([x.unsqueeze(0) for x in control_tensors])
-            
+
             # handle control tensor list
             if any([x.control_tensor_list is not None for x in self.file_items]):
                 self.control_tensor_list = []
@@ -187,8 +208,7 @@ class DataLoaderBatchDTO:
                         self.control_tensor_list.append(x.control_tensor_list)
                     else:
                         raise Exception(f"Could not find control tensors for all file items, missing for {x.path}")
-                    
-                
+
             self.inpaint_tensor: Union[torch.Tensor, None] = None
             if any([x.inpaint_tensor is not None for x in self.file_items]):
                 # find one to use as a base
@@ -284,7 +304,7 @@ class DataLoaderBatchDTO:
                         self.clip_image_embeds_unconditional.append(x.clip_image_embeds_unconditional)
                     else:
                         raise Exception("clip_image_embeds_unconditional is None for some file items")
-            
+
             if any([x.prompt_embeds is not None for x in self.file_items]):
                 # find one to use as a base
                 base_prompt_embeds = None
@@ -299,10 +319,10 @@ class DataLoaderBatchDTO:
                     else:
                         prompt_embeds_list.append(x.prompt_embeds)
                 self.prompt_embeds = concat_prompt_embeds(prompt_embeds_list)
-                    
+
 
         except Exception as e:
-            print(e)
+            # print(e)
             raise e
 
     def get_is_reg_list(self):
@@ -333,7 +353,7 @@ class DataLoaderBatchDTO:
         del self.control_tensor
         for file_item in self.file_items:
             file_item.cleanup()
-    
+
     @property
     def dataset_config(self) -> 'DatasetConfig':
         if len(self.file_items) > 0:
