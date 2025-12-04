@@ -8,7 +8,8 @@ from typing import List, TYPE_CHECKING
 import tarfile
 import io
 import subprocess
-import uuid # Added for random renaming
+import uuid
+import platform
 
 import cv2
 import numpy as np
@@ -28,8 +29,6 @@ from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatc
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 
-import platform
-
 def is_native_windows():
     return platform.system() == "Windows" and platform.release() != "2"
 
@@ -43,19 +42,11 @@ video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.f
 
 class RescaleTransform:
     """Transform to rescale images to the range [-1, 1]."""
-
     def __call__(self, image):
         return image * 2 - 1
 
 
 class NormalizeSDXLTransform:
-    """
-    Transforms the range from 0 to 1 to SDXL mean and std per channel based on avgs over thousands of images
-
-    Mean: tensor([ 0.0002, -0.1034, -0.1879])
-    Standard Deviation: tensor([0.5436, 0.5116, 0.5033])
-    """
-
     def __call__(self, image):
         return transforms.Normalize(
             mean=[0.0002, -0.1034, -0.1879],
@@ -64,14 +55,6 @@ class NormalizeSDXLTransform:
 
 
 class NormalizeSD15Transform:
-    """
-    Transforms the range from 0 to 1 to SDXL mean and std per channel based on avgs over thousands of images
-
-    Mean: tensor([-0.1600, -0.2450, -0.3227])
-    Standard Deviation: tensor([0.5319, 0.4997, 0.5139])
-
-    """
-
     def __call__(self, image):
         return transforms.Normalize(
             mean=[-0.1600, -0.2450, -0.3227],
@@ -92,15 +75,12 @@ class ImageDataset(Dataset, CaptionMixin):
             self.caption_type = self.get_config('caption_ext', 'txt')
         else:
             self.caption_type = None
-        # we always random crop if random scale is enabled
         self.random_crop = self.random_scale if self.random_scale else self.get_config('random_crop', False)
 
         self.resolution = self.get_config('resolution', 256)
         self.file_list = [os.path.join(self.path, file) for file in os.listdir(self.path) if
                           file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
 
-        # this might take a while
-        # print_acc(f"  -  Preprocessing image dimensions")
         new_file_list = []
         bad_count = 0
         for file in tqdm(self.file_list):
@@ -109,16 +89,12 @@ class ImageDataset(Dataset, CaptionMixin):
             except image_utils.UnknownImageFormat:
                 img = exif_transpose(Image.open(file))
                 w, h = img.size
-            # img = Image.open(file)
             if int(min([w, h]) * self.scale) >= self.resolution:
                 new_file_list.append(file)
             else:
                 bad_count += 1
 
         self.file_list = new_file_list
-
-        # print_acc(f"  -  Found {len(self.file_list)} images")
-        # print_acc(f"  -  Found {bad_count} images that are too small")
         assert len(self.file_list) > 0, f"no images found in {self.path}"
 
         self.transform = transforms.Compose([
@@ -143,20 +119,14 @@ class ImageDataset(Dataset, CaptionMixin):
         try:
             img = exif_transpose(Image.open(img_path)).convert('RGB')
         except Exception as e:
-            # print_acc(f"Error opening image: {img_path}")
-            # print_acc(e)
-            # make a noise image if we can't open it
             img = Image.fromarray(np.random.randint(0, 255, (1024, 1024, 3), dtype=np.uint8))
 
-        # Downscale the source image first
         img = img.resize((int(img.size[0] * self.scale), int(img.size[1] * self.scale)), Image.BICUBIC)
         min_img_size = min(img.size)
 
         if self.random_crop:
             if self.random_scale and min_img_size > self.resolution:
                 if min_img_size < self.resolution:
-                    # print_acc(
-                    #     f"Unexpected values: min_img_size={min_img_size}, self.resolution={self.resolution}, image file={img_path}")
                     scale_size = self.resolution
                 else:
                     scale_size = random.randint(self.resolution, int(min_img_size))
@@ -186,36 +156,21 @@ class AugmentedImageDataset(ImageDataset):
 
         augmentation_list = []
         for aug in self.augmentations:
-            # make sure method name is valid
             assert hasattr(A, aug.method_name), f"invalid augmentation method: {aug.method_name}"
-            # get the method
             method = getattr(A, aug.method_name)
-            # add the method to the list
             augmentation_list.append(method(**aug.params))
 
         self.aug_transform = A.Compose(augmentation_list)
         self.original_transform = self.transform
-        # replace transform so we get raw pil image
         self.transform = transforms.Compose([])
 
     def __getitem__(self, index):
-        # get the original image
-        # image is a PIL image, convert to bgr
         pil_image = super().__getitem__(index)
         open_cv_image = np.array(pil_image)
-        # Convert RGB to BGR
         open_cv_image = open_cv_image[:, :, ::-1].copy()
-
-        # apply augmentations
         augmented = self.aug_transform(image=open_cv_image)["image"]
-
-        # convert back to RGB tensor
         augmented = cv2.cvtColor(augmented, cv2.COLOR_BGR2RGB)
-
-        # convert to PIL image
         augmented = Image.fromarray(augmented)
-
-        # return both # return image as 0 - 1 tensor
         return transforms.ToTensor()(pil_image), transforms.ToTensor()(augmented)
 
 
@@ -236,7 +191,6 @@ class PairedImageDataset(Dataset):
         supported_exts = ('.jpg', '.jpeg', '.png', '.webp', '.JPEG', '.JPG', '.PNG', '.WEBP')
 
         if self.pos_folder is not None and self.neg_folder is not None:
-            # find matching files
             self.pos_file_list = [os.path.join(self.pos_folder, file) for file in os.listdir(self.pos_folder) if
                                   file.lower().endswith(supported_exts)]
             self.neg_file_list = [os.path.join(self.neg_folder, file) for file in os.listdir(self.neg_folder) if
@@ -251,15 +205,11 @@ class PairedImageDataset(Dataset):
                         matched_files.append((neg_file, pos_file))
                         break
 
-            # remove duplicates
             matched_files = [t for t in (set(tuple(i) for i in matched_files))]
-
             self.file_list = matched_files
-            # print_acc(f"  -  Found {len(self.file_list)} matching pairs")
         else:
             self.file_list = [os.path.join(self.path, file) for file in os.listdir(self.path) if
                               file.lower().endswith(supported_exts)]
-            # print_acc(f"  -  Found {len(self.file_list)} images")
 
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -270,8 +220,6 @@ class PairedImageDataset(Dataset):
         prompts = []
         for index in range(len(self.file_list)):
             prompts.append(self.get_prompt_item(index))
-
-        # remove duplicates
         prompts = list(set(prompts))
         return prompts
 
@@ -290,7 +238,6 @@ class PairedImageDataset(Dataset):
     def get_prompt_item(self, index):
         img_path_or_tuple = self.file_list[index]
         if isinstance(img_path_or_tuple, tuple):
-            # check if either has a prompt file
             path_no_ext = os.path.splitext(img_path_or_tuple[0])[0]
             prompt_path = path_no_ext + '.txt'
             if not os.path.exists(prompt_path):
@@ -298,21 +245,16 @@ class PairedImageDataset(Dataset):
                 prompt_path = path_no_ext + '.txt'
         else:
             img_path = img_path_or_tuple
-            # see if prompt file exists
             path_no_ext = os.path.splitext(img_path)[0]
             prompt_path = path_no_ext + '.txt'
 
         if os.path.exists(prompt_path):
             with open(prompt_path, 'r', encoding='utf-8') as f:
                 prompt = f.read()
-                # remove any newlines
                 prompt = prompt.replace('\n', ', ')
-                # remove new lines for all operating systems
                 prompt = prompt.replace('\r', ', ')
                 prompt_split = prompt.split(',')
-                # remove empty strings
                 prompt_split = [p.strip() for p in prompt_split if p.strip()]
-                # join back together
                 prompt = ', '.join(prompt_split)
         else:
             prompt = self.default_prompt
@@ -321,21 +263,17 @@ class PairedImageDataset(Dataset):
     def __getitem__(self, index):
         img_path_or_tuple = self.file_list[index]
         if isinstance(img_path_or_tuple, tuple):
-            # load both images
             img_path = img_path_or_tuple[0]
             img1 = exif_transpose(Image.open(img_path)).convert('RGB')
             img_path = img_path_or_tuple[1]
             img2 = exif_transpose(Image.open(img_path)).convert('RGB')
 
-            # always use # 2 (pos)
             bucket_resolution = get_bucket_for_image_size(
                 width=img2.width,
                 height=img2.height,
                 resolution=self.size,
-                # divisibility=self.
             )
 
-            # images will be same base dimension, but may be trimmed. We need to shrink and then central crop
             if bucket_resolution['width'] > bucket_resolution['height']:
                 img1_scale_to_height = bucket_resolution["height"]
                 img1_scale_to_width = int(img1.width * (bucket_resolution["height"] / img1.height))
@@ -352,13 +290,11 @@ class PairedImageDataset(Dataset):
             img2_crop_height = bucket_resolution["height"]
             img2_crop_width = bucket_resolution["width"]
 
-            # scale then center crop images
             img1 = img1.resize((img1_scale_to_width, img1_scale_to_height), Image.BICUBIC)
             img1 = transforms.CenterCrop((img1_crop_height, img1_crop_width))(img1)
             img2 = img2.resize((img2_scale_to_width, img2_scale_to_height), Image.BICUBIC)
             img2 = transforms.CenterCrop((img2_crop_height, img2_crop_width))(img2)
 
-            # combine them side by side
             img = Image.new('RGB', (img1.width + img2.width, max(img1.height, img2.height)))
             img.paste(img1, (0, 0))
             img.paste(img2, (img1.width, 0))
@@ -366,10 +302,7 @@ class PairedImageDataset(Dataset):
             img_path = img_path_or_tuple
             img = exif_transpose(Image.open(img_path)).convert('RGB')
             height = self.size
-            # determine width to keep aspect ratio
             width = int(img.size[0] * height / img.size[1])
-
-            # Downscale the source image first
             img = img.resize((width, height), Image.BICUBIC)
 
         prompt = self.get_prompt_item(index)
@@ -387,7 +320,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             sd: 'StableDiffusion' = None,
     ):
         self.dataset_config = dataset_config
-        # update bucket divisibility
         self.dataset_config.bucket_tolerance = sd.get_bucket_divisibility()
         self.is_video = dataset_config.num_frames > 1
         super().__init__()
@@ -415,7 +347,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         self.random_scale = dataset_config.random_scale
         self.scale = dataset_config.scale
         self.batch_size = batch_size
-        # we always random crop if random scale is enabled
         self.random_crop = self.random_scale if self.random_scale else dataset_config.random_crop
         self.resolution = dataset_config.resolution
         self.caption_dict = None
@@ -425,17 +356,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         dataset_folder = self.dataset_path
 
         if self.dataset_path.endswith('.tar.gz.gpg'):
-            # Decrypt to memory without touching disk
-            # print_acc(f"Decrypting dataset: {self.dataset_path}")
             passphrase = os.environ.get('DATASET_PASSWORD', '')
             if not passphrase:
                 raise ValueError("DATASET_PASSWORD environment variable not set for encrypted dataset")
             
             cmd = ['gpg', '--decrypt', '--batch', '--passphrase', passphrase, self.dataset_path]
-            # Capture stdout to memory
             proc = subprocess.run(cmd, capture_output=True, check=True)
             
-            # Open tar from memory
             tar_stream = io.BytesIO(proc.stdout)
             temp_data = {}
             with tarfile.open(fileobj=tar_stream, mode='r:gz') as tar:
@@ -445,42 +372,34 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                         if f:
                             temp_data[member.name] = f.read()
             
-            # Obfuscation: Rename files to random UUIDs while preserving pairing
             self.in_memory_data = {}
             file_groups = {}
             
-            # Group files by their base path (stripping extensions)
             for filename in temp_data.keys():
                 base, ext = os.path.splitext(filename)
                 if base not in file_groups:
                     file_groups[base] = []
                 file_groups[base].append((filename, ext))
             
-            # Rebuild in_memory_data with random names
             for base_key, associated_files in file_groups.items():
                 random_name = uuid.uuid4().hex
                 for original_filename, ext in associated_files:
-                    # Flatten structure: random_name + ext
                     new_filename = f"{random_name}{ext}"
                     self.in_memory_data[new_filename] = temp_data[original_filename]
             
-            # Cleanup raw data
             del temp_data
             del proc
             del tar_stream
 
-            # Populate file list from new obfuscated keys
             extensions = image_extensions if not self.is_video else video_extensions
             file_list = [k for k in self.in_memory_data.keys() if k.lower().endswith(tuple(extensions))]
             file_list.sort()
             
-            dataset_folder = "" # virtual root
+            dataset_folder = "" 
 
-        # check if dataset_path is a folder or json
         elif os.path.isdir(self.dataset_path):
             extensions = image_extensions
             if self.is_video:
-                # only look for videos
                 extensions = video_extensions
             file_list = [os.path.join(root, file) for root, _, files in os.walk(self.dataset_path) for file in files if file.lower().endswith(tuple(extensions))]
             
@@ -495,28 +414,20 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                         self.size_database = json.load(f)
                     
                     if "__version__" not in self.size_database or self.size_database["__version__"] != dataloader_version:
-                        # print_acc("Upgrading size database to new version")
-                        # old version, delete and recreate
                         self.size_database = {}
                 except Exception as e:
-                    # print_acc(f"Error loading size database: {dataset_size_file}")
-                    # print_acc(e)
                     self.size_database = {}
             
             self.size_database["__version__"] = dataloader_version
 
         else:
-            # assume json
             with open(self.dataset_path, 'r') as f:
                 self.caption_dict = json.load(f)
-                # keys are file paths
                 file_list = list(self.caption_dict.keys())
                 
-        # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
         if self.dataset_config.num_repeats > 1:
-            # repeat the list
             file_list = file_list * self.dataset_config.num_repeats
 
         if self.dataset_config.standardize_images:
@@ -536,13 +447,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 RescaleTransform(),
             ])
 
-        # this might take a while
-        # print_acc(f"Dataset: {self.dataset_path}")
-        # if self.is_video:
-        #     print_acc(f"  -  Preprocessing video dimensions")
-        # else:
-        #     print_acc(f"  -  Preprocessing image dimensions")
-
         bad_count = 0
         for file in tqdm(file_list):
             try:
@@ -558,61 +462,32 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 )
                 self.file_list.append(file_item)
             except Exception as e:
-                # print_acc(traceback.format_exc())
-                # if self.is_video:
-                #     print_acc(f"Error processing video: {file}")
-                # else:
-                #     print_acc(f"Error processing image: {file}")
-                # print_acc(e)
                 bad_count += 1
 
-        # save the size database only if on disk
         if self.in_memory_data is None and os.path.isdir(self.dataset_path):
             dataset_size_file = os.path.join(dataset_folder, '.aitk_size.json')
             with open(dataset_size_file, 'w') as f:
                 json.dump(self.size_database, f)
         
-        # if self.is_video:
-        #     print_acc(f"  -  Found {len(self.file_list)} videos")
-        #     assert len(self.file_list) > 0, f"no videos found in {self.dataset_path}"
-        # else:
-        #     print_acc(f"  -  Found {len(self.file_list)} images")
-        #     assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
-
-        # handle x axis flips
         if self.dataset_config.flip_x:
-            # print_acc("  -  adding x axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
-                # create a copy that is flipped on the x axis
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_x = True
                 self.file_list.append(new_file_item)
 
-        # handle y axis flips
         if self.dataset_config.flip_y:
-            # print_acc("  -  adding y axis flips")
             current_file_list = [x for x in self.file_list]
             for file_item in current_file_list:
-                # create a copy that is flipped on the y axis
                 new_file_item = copy.deepcopy(file_item)
                 new_file_item.flip_y = True
                 self.file_list.append(new_file_item)
-
-        # if self.dataset_config.flip_x or self.dataset_config.flip_y:
-        #     if self.is_video:
-        #         print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
-        #     else:
-        #         print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
 
         self.setup_epoch()
 
     def setup_epoch(self):
         if self.epoch_num == 0:
-            # initial setup
-            # do not call for now
             if self.dataset_config.buckets:
-                # setup buckets
                 self.setup_buckets()
             if self.is_caching_latents:
                 self.cache_latents_all_latents()
@@ -621,12 +496,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.is_caching_text_embeddings:
                 self.cache_text_embeddings()
             if self.is_generating_controls:
-                # always do this last
                 self.setup_controls()
         else:
             if self.dataset_config.poi is not None:
-                # handle cropping to a specific point of interest
-                # setup buckets every epoch
                 self.setup_buckets(quiet=True)
         self.epoch_num += 1
 
@@ -643,16 +515,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
     def __getitem__(self, item):
         if self.dataset_config.buckets:
-            # for buckets we collate ourselves for now
-            # todo allow a scheduler to dynamically make buckets
-            # we collate ourselves
             if len(self.batch_indices) - 1 < item:
-                # tried everything to solve this. No way to reset length when redoing things. Pick another index
                 item = random.randint(0, len(self.batch_indices) - 1)
             idx_list = self.batch_indices[item]
             return [self._get_single_item(idx) for idx in idx_list]
         else:
-            # Dataloader is batching
             return self._get_single_item(item)
 
 
@@ -669,18 +536,15 @@ def get_dataloader_from_datasets(
     is_caching_latents = False
 
     dataset_config_list = []
-    # preprocess them all
     for dataset_option in dataset_options:
         if isinstance(dataset_option, DatasetConfig):
             dataset_config_list.append(dataset_option)
         else:
-            # preprocess raw data
             split_configs = preprocess_dataset_raw_config([dataset_option])
             for x in split_configs:
                 dataset_config_list.append(DatasetConfig(**x))
 
     for config in dataset_config_list:
-
         if config.type == 'image':
             dataset = AiToolkitDataset(config, batch_size=batch_size, sd=sd)
             datasets.append(dataset)
@@ -693,17 +557,11 @@ def get_dataloader_from_datasets(
 
     concatenated_dataset = ConcatDataset(datasets)
 
-    # todo build scheduler that can get buckets from all datasets that match
-    # todo and evenly distribute reg images
-
     def dto_collation(batch: List['FileItemDTO']):
-        # create DTO batch
         batch = DataLoaderBatchDTO(
             file_items=batch
         )
         return batch
-
-    # check if is caching latents
 
     dataloader_kwargs = {}
     
@@ -714,16 +572,15 @@ def get_dataloader_from_datasets(
         dataloader_kwargs['prefetch_factor'] = dataset_config_list[0].prefetch_factor
 
     if has_buckets:
-        # make sure they all have buckets
         for dataset in datasets:
             assert dataset.dataset_config.buckets, f"buckets not found on dataset {dataset.dataset_config.folder_path}, you either need all buckets or none"
 
         data_loader = DataLoader(
             concatenated_dataset,
-            batch_size=None,  # we batch in the datasets for now
+            batch_size=None,
             drop_last=False,
             shuffle=True,
-            collate_fn=dto_collation,  # Use the custom collate function
+            collate_fn=dto_collation,
             **dataloader_kwargs
         )
     else:
@@ -738,7 +595,6 @@ def get_dataloader_from_datasets(
 
 
 def trigger_dataloader_setup_epoch(dataloader: DataLoader):
-    # hacky but needed because of different types of datasets and dataloaders
     dataloader.len = None
     if isinstance(dataloader.dataset, list):
         for dataset in dataloader.dataset:
@@ -761,7 +617,6 @@ def trigger_dataloader_setup_epoch(dataloader: DataLoader):
                 sub_dataset.len = None
 
 def get_dataloader_datasets(dataloader: DataLoader):
-    # hacky but needed because of different types of datasets and dataloaders
     if isinstance(dataloader.dataset, list):
         datasets = []
         for dataset in dataloader.dataset:
