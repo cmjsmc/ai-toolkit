@@ -1,9 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { PrismaClient } from '@prisma/client';
 import path from 'path';
 import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
-
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 import sqlite3 from 'sqlite3';
 
 export const runtime = 'nodejs';
@@ -32,18 +32,17 @@ function closeDb(db: sqlite3.Database) {
 }
 
 export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
-  // this must be awaited to avoid TS error
   const { jobID } = await params;
 
   const job = await prisma.job.findUnique({ where: { id: jobID } });
-  if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+  if (!job) return encryptedJsonResponse({ error: 'Job not found' }, { status: 404 });
 
   const trainingFolder = await getTrainingFolder();
   const jobFolder = path.join(trainingFolder, job.name);
   const logPath = path.join(jobFolder, 'loss_log.db');
 
   if (!fs.existsSync(logPath)) {
-    return NextResponse.json({ keys: [], key: 'loss', points: [] });
+    return encryptedJsonResponse({ keys: [], key: 'loss', points: [] });
   }
 
   const url = new URL(request.url);
@@ -83,7 +82,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       [key, sinceStep, sinceStep, stride, limit]
     );
 
-    return NextResponse.json({
+    return encryptedJsonResponse({
       key,
       keys,
       points: points.map((p) => ({
