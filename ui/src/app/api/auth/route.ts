@@ -1,6 +1,6 @@
-import { NextResponse } from 'next/server';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 export async function GET() {
   // if this gets hit, auth has already been verified
-  return NextResponse.json({ isAuthenticated: true });
+  return encryptedJsonResponse({ isAuthenticated: true });
 }
