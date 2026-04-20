@@ -1,8 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { PrismaClient } from '@prisma/client';
 import { getTrainingFolder } from '@/server/settings';
 import path from 'path';
 import fs from 'fs';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 const prisma = new PrismaClient();
 
@@ -14,7 +15,7 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   });
 
   if (!job) {
-    return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    return encryptedJsonResponse({ error: 'Job not found' }, { status: 404 });
   }
 
   const trainingRoot = await getTrainingFolder();
@@ -28,5 +29,5 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     where: { id: jobID },
   });
 
-  return NextResponse.json(job);
+  return encryptedJsonResponse(job);
 }
