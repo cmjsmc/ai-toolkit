@@ -1,8 +1,8 @@
-import { NextResponse } from 'next/server';
 import si from 'systeminformation';
 import { createRequire } from 'module';
 import os from 'os';
 import { CpuInfo } from '@/types';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 const isMac = os.platform() === 'darwin';
 
@@ -53,10 +53,10 @@ export async function GET() {
       };
     }
 
-    return NextResponse.json(cpuInfo);
+    return encryptedJsonResponse(cpuInfo);
   } catch (error) {
     console.error('Error fetching CPU stats:', error);
-    return NextResponse.json(
+    return encryptedJsonResponse(
       {
         error: `Failed to fetch CPU stats: ${error instanceof Error ? error.message : String(error)}`,
       },
