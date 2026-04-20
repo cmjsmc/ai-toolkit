@@ -1,5 +1,6 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { PrismaClient } from '@prisma/client';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 const prisma = new PrismaClient();
 
@@ -10,7 +11,6 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     where: { id: jobID },
   });
 
-  // update job status to 'running'
   await prisma.job.update({
     where: { id: jobID },
     data: {
@@ -23,5 +23,5 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
 
   console.log(`Job ${jobID} marked as stopped`);
 
-  return NextResponse.json(job);
+  return encryptedJsonResponse(job);
 }
