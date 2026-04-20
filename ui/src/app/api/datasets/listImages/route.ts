@@ -1,18 +1,18 @@
-import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { getDecryptedJson, encryptedJsonResponse } from '@/utils/serverEncryption';
 
 export async function POST(request: Request) {
   const datasetsPath = await getDatasetsRoot();
-  const body = await request.json();
+  const body = await getDecryptedJson(request);
   const { datasetName } = body;
   const datasetFolder = path.join(datasetsPath, datasetName);
 
   try {
     // Check if folder exists
     if (!fs.existsSync(datasetFolder)) {
-      return NextResponse.json({ error: `Folder '${datasetName}' not found` }, { status: 404 });
+      return encryptedJsonResponse({ error: `Folder '${datasetName}' not found` }, { status: 404 });
     }
 
     // Find all images recursively
@@ -23,10 +23,10 @@ export async function POST(request: Request) {
       img_path: imgPath,
     }));
 
-    return NextResponse.json({ images: result });
+    return encryptedJsonResponse({ images: result });
   } catch (error) {
     console.error('Error finding images:', error);
-    return NextResponse.json({ error: 'Failed to process request' }, { status: 500 });
+    return encryptedJsonResponse({ error: 'Failed to process request' }, { status: 500 });
   }
 }
 
