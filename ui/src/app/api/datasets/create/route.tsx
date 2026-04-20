@@ -1,11 +1,11 @@
-import { NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { getDecryptedJson, encryptedJsonResponse } from '@/utils/serverEncryption';
 
 export async function POST(request: Request) {
   try {
-    const body = await request.json();
+    const body = await getDecryptedJson(request);
     let { name } = body;
     // clean name by making lower case,  removing special characters, and replacing spaces with underscores
     name = name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
@@ -18,8 +18,8 @@ export async function POST(request: Request) {
       fs.mkdirSync(datasetPath);
     }
 
-    return NextResponse.json({ success: true, name: name });
+    return encryptedJsonResponse({ success: true, name: name });
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to create dataset' }, { status: 500 });
+    return encryptedJsonResponse({ error: 'Failed to create dataset' }, { status: 500 });
   }
 }
