@@ -1,8 +1,9 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextRequest } from 'next/server';
 import { PrismaClient } from '@prisma/client';
 import path from 'path';
 import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 const prisma = new PrismaClient();
 
@@ -14,17 +15,16 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
   });
 
   if (!job) {
-    return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    return encryptedJsonResponse({ error: 'Job not found' }, { status: 404 });
   }
 
   const trainingFolder = await getTrainingFolder();
   const jobFolder = path.join(trainingFolder, job.name);
 
   if (!fs.existsSync(jobFolder)) {
-    return NextResponse.json({ files: [] });
+    return encryptedJsonResponse({ files: [] });
   }
 
-  // find all safetensors files in the job folder
   let files = fs
     .readdirSync(jobFolder)
     .filter(file => {
@@ -35,7 +35,6 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     })
     .sort();
 
-  // get the file size for each file
   const fileObjects = files.map(file => {
     const stats = fs.statSync(file);
     return {
@@ -44,5 +43,5 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     };
   });
 
-  return NextResponse.json({ files: fileObjects });
+  return encryptedJsonResponse({ files: fileObjects });
 }
