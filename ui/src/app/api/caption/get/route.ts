@@ -3,11 +3,12 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot } from '@/server/settings';
+import { getDecryptedJson, encryptedJsonResponse } from '@/utils/serverEncryption';
 
 export async function POST(request: NextRequest) {
   let body;
   try {
-    body = await request.json();
+    body = await getDecryptedJson(request);
   } catch {
     // Client aborted the request before body was fully sent
     return new NextResponse(null, { status: 499 });
@@ -41,14 +42,14 @@ export async function POST(request: NextRequest) {
     // Check if file exists
     if (!fs.existsSync(captionPath)) {
       // send back blank string if caption file does not exist
-      return new NextResponse('');
+      return encryptedJsonResponse('');
     }
 
     // Read caption file
     const caption = fs.readFileSync(captionPath, 'utf-8');
 
-    // Return caption
-    return new NextResponse(caption);
+    // Return caption (encrypted envelope abstracts it)
+    return encryptedJsonResponse(caption);
   } catch (error) {
     console.error('Error getting caption:', error);
     return new NextResponse('Error getting caption', { status: 500 });
