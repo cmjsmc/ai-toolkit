@@ -1,6 +1,6 @@
-import { NextResponse } from 'next/server';
 import fs from 'fs';
 import { getDatasetsRoot } from '@/server/settings';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 export async function GET() {
   try {
@@ -18,8 +18,8 @@ export async function GET() {
       .filter(dirent => !dirent.name.startsWith('.'))
       .map(dirent => dirent.name);
 
-    return NextResponse.json(folders);
+    return encryptedJsonResponse(folders);
   } catch (error) {
-    return NextResponse.json({ error: 'Failed to fetch datasets' }, { status: 500 });
+    return encryptedJsonResponse({ error: 'Failed to fetch datasets' }, { status: 500 });
   }
 }
