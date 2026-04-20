@@ -1,8 +1,8 @@
-import { NextResponse } from 'next/server';
 import { exec, execSync } from 'child_process';
 import { promisify } from 'util';
 import { createRequire } from 'module';
 import os from 'os';
+import { encryptedJsonResponse } from '@/utils/serverEncryption';
 
 const execAsync = promisify(exec);
 
@@ -17,10 +17,10 @@ interface MacGpuResult {
 }
 
 async function getMacGpuInfo(): Promise<MacGpuResult | null> {
+  // [Internal identical to original code]
   try {
     const memoryTotal = os.totalmem() / (1024 * 1024);
 
-    // Get GPU name and core count from system_profiler
     let gpuName = 'Apple GPU';
     try {
       const spOut = execSync(
@@ -47,7 +47,6 @@ async function getMacGpuInfo(): Promise<MacGpuResult | null> {
     let memTotal = memoryTotal;
 
     try {
-      // Use createRequire to hide from webpack static analysis so it doesn't fail on non-mac platforms
       const nativeRequire = createRequire(import.meta.url);
       const ms = nativeRequire('macstats') as any;
 
@@ -95,7 +94,6 @@ async function getMacGpuInfo(): Promise<MacGpuResult | null> {
 
 export async function GET() {
   try {
-    // Get platform
     const platform = os.platform();
     const isWindows = platform === 'win32';
     const isMac = platform === 'darwin';
@@ -103,7 +101,7 @@ export async function GET() {
     if (isMac) {
       const macGpu = await getMacGpuInfo();
       if (macGpu) {
-        return NextResponse.json({
+        return encryptedJsonResponse({
           hasNvidiaSmi: false,
           isMac: true,
           gpus: [
@@ -128,7 +126,7 @@ export async function GET() {
           ],
         });
       }
-      return NextResponse.json({
+      return encryptedJsonResponse({
         hasNvidiaSmi: false,
         isMac: true,
         gpus: [],
@@ -136,11 +134,10 @@ export async function GET() {
       });
     }
 
-    // Check if nvidia-smi is available
     const hasNvidiaSmi = await checkNvidiaSmi(isWindows);
 
     if (!hasNvidiaSmi) {
-      return NextResponse.json({
+      return encryptedJsonResponse({
         hasNvidiaSmi: false,
         isMac: false,
         gpus: [],
@@ -148,16 +145,15 @@ export async function GET() {
       });
     }
 
-    // Get GPU stats
     const gpuStats = await getGpuStats(isWindows);
 
-    return NextResponse.json({
+    return encryptedJsonResponse({
       hasNvidiaSmi: true,
       gpus: gpuStats,
     });
   } catch (error) {
     console.error('Error fetching NVIDIA GPU stats:', error);
-    return NextResponse.json(
+    return encryptedJsonResponse(
       {
         hasNvidiaSmi: false,
         isMac: false,
@@ -172,12 +168,8 @@ export async function GET() {
 async function checkNvidiaSmi(isWindows: boolean): Promise<boolean> {
   try {
     if (isWindows) {
-      // Check if nvidia-smi is available on Windows
-      // It's typically located in C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe
-      // but we'll just try to run it directly as it may be in PATH
       await execAsync('nvidia-smi -L');
     } else {
-      // Linux/macOS check
       await execAsync('which nvidia-smi');
     }
     return true;
@@ -187,16 +179,13 @@ async function checkNvidiaSmi(isWindows: boolean): Promise<boolean> {
 }
 
 async function getGpuStats(isWindows: boolean) {
-  // Command is the same for both platforms, but the path might be different
   const command =
     'nvidia-smi --query-gpu=index,name,driver_version,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.free,memory.used,power.draw,power.limit,clocks.current.graphics,clocks.current.memory,fan.speed --format=csv,noheader,nounits';
 
-  // Execute command
   const { stdout } = await execAsync(command, {
     env: { ...process.env, CUDA_DEVICE_ORDER: 'PCI_BUS_ID' },
   });
 
-  // Parse CSV output
   const gpus = stdout
     .trim()
     .split('\n')
@@ -241,11 +230,10 @@ async function getGpuStats(isWindows: boolean) {
           memory: parseInt(clockMemory),
         },
         fan: {
-          speed: parseInt(fanSpeed) || 0, // Some GPUs might not report fan speed, default to 0
+          speed: parseInt(fanSpeed) || 0,
         },
       };
     });
 
   return gpus;
 }
-
