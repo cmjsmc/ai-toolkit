@@ -45,6 +45,9 @@ class Flux2KleinModel(Flux2Model):
             torch_dtype=dtype,
             low_cpu_mem_usage=True,
         )
+
+        self.patch_sensitive_layers_to_fp32(text_encoder)
+        
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing Qwen3")
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
