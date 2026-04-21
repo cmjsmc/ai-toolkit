@@ -98,12 +98,18 @@ class Flux2Model(BaseModel):
 
         self.print_and_status_update(f"Patching sensitive layers in {model.__class__.__name__} to float32...")
         for name, module in model.named_modules():
-            # Target Norms and RoPE/Time embeddings
-            is_norm = isinstance(module, (torch.nn.LayerNorm, torch.nn.GroupNorm)) or 'norm' in module.__class__.__name__.lower()
-            is_rope = 'rope' in name.lower() or 'rotary' in name.lower() or 'time' in name.lower()
+            module_class_name = module.__class__.__name__.lower()
             
-            if (is_norm or is_rope) and len(list(module.children())) == 0:
-                # Upcast weights
+            # Target Norms
+            is_norm = isinstance(module, (torch.nn.LayerNorm, torch.nn.GroupNorm)) or 'norm' in module_class_name
+            # Target RoPE or Timestep representations (e.g., creating sinusoidal beds)
+            is_rope_or_time = 'rope' in module_class_name or 'rotary' in module_class_name or 'timestep' in module_class_name
+            
+            # EXCLUDE heavy layers that shouldn't be touched (Linear, Conv, Embedding)
+            is_heavy_layer = isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Embedding)) or 'linear' in module_class_name or 'conv' in module_class_name
+            
+            if (is_norm or is_rope_or_time) and not is_heavy_layer and len(list(module.children())) == 0:
+                # Upcast weights (if the module has any)
                 module.to(torch.float32)
                 
                 # Wrap the forward pass to handle mixed inputs/outputs
@@ -116,7 +122,7 @@ class Flux2Model(BaseModel):
                         
                         out = orig_fwd(*new_args, **new_kwargs)
                         
-                        # Downcast outputs back to fp16
+                        # Downcast outputs back to fp16 so the next Linear layer is happy
                         if isinstance(out, torch.Tensor) and out.is_floating_point():
                             return out.to(torch.float16)
                         if isinstance(out, tuple):
