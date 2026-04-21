@@ -231,7 +231,7 @@ class Flux2Model(BaseModel):
             
             # 2. Block-by-block quantization using BFL native block names
             all_blocks = list(transformer.double_blocks) + list(transformer.single_blocks)
-            for block all_blocks:
+            for block in all_blocks:
                 block.to(self.device_torch, dtype=dtype)
                 quantize(block, weights=quantization_type, **quantize_kwargs)
                 freeze(block)
