@@ -152,6 +152,10 @@ class Flux2Model(BaseModel):
         
         # Load directly, delete the dict from RAM, then cast layer-by-layer
         transformer.load_state_dict(transformer_state_dict, assign=True)
+        
+        from toolkit.train_tools import patch_fp16_overflow_layers
+        patch_fp16_overflow_layers(transformer)
+        
         del transformer_state_dict
         transformer.to(dtype)
 
