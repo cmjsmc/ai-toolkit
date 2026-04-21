@@ -763,3 +763,88 @@ def precondition_model_outputs_flow_match(model_output, model_input, timestep_te
         out = mo_chunks[idx] * (-sigmas) + mi_chunks[idx]
         out_chunks.append(out)
     return torch.cat(out_chunks, dim=0)
+
+def patch_fp16_overflow_layers(model: torch.nn.Module):
+    """
+    Forces specific layers known to cause NaN in fp16 to run in float32.
+    These layers (like MLPEmbedder, AdaLN Modulations, LastLayer) frequently 
+    exceed the fp16 limit (65504) during variance/norm calculations.
+    Also adds a flag to exclude them from quantization.
+    """
+    target_modules = []
+
+    for name, module in model.named_modules():
+        class_name = module.__class__.__name__
+        is_target = False
+        
+        # 1. MLPEmbedder (for time_in and guidance_in)
+        if any(k in class_name for k in ["MLPEmbedder", "TimestepEmbedding", "CombinedTimestep"]) or \
+           any(k in name for k in ["time_text_embed", "timestep_embedder", "guidance_embedder", "time_embedding", "add_embedding"]):
+            is_target = True
+            
+        # 2. Modulation (AdaLayerNorm, norm layers)
+        elif any(k in class_name for k in ["Modulation", "AdaLayerNorm", "LayerNorm", "RMSNorm"]) or \
+             any(k in name.split('.')[-1] for k in ["norm", "norm1", "norm2", "norm_out", "norm_q", "norm_k", "norm1_context", "norm2_context", "spatial_norm"]):
+            is_target = True
+            
+        # 3. LastLayer (contains adaLN_modulation) / proj_out
+        elif any(k in class_name for k in ["LastLayer"]) or \
+             any(k in name for k in ["proj_out"]):
+            is_target = True
+
+        if is_target:
+            # We don't want to wrap entire massive blocks, only specific compute nodes
+            if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm, torch.nn.SiLU, torch.nn.Sequential, torch.nn.Embedding)):
+                target_modules.append(module)
+
+    for module in target_modules:
+        if getattr(module, "_is_fp32_patched", False):
+            continue
+            
+        orig_forward = module.forward
+        
+        def make_wrapper(orig_fwd, mod):
+            def wrapper(*args, **kwargs):
+                # Ensure weights are float32
+                for p in mod.parameters(recurse=False):
+                    if p.is_floating_point() and p.dtype != torch.float32:
+                        p.data = p.data.to(torch.float32)
+                        if p.grad is not None and p.grad.dtype != torch.float32:
+                            p.grad.data = p.grad.data.to(torch.float32)
+                        
+                # Cast inputs to float32
+                new_args = tuple(a.to(torch.float32) if isinstance(a, torch.Tensor) and a.is_floating_point() else a for a in args)
+                new_kwargs = {k: v.to(torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in kwargs.items()}
+                
+                device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+                if hasattr(mod, 'weight') and mod.weight is not None:
+                    device_type = mod.weight.device.type
+                    
+                with torch.autocast(device_type=device_type, enabled=False):
+                    out = orig_fwd(*new_args, **new_kwargs)
+                
+                # Determine original dtype to cast output back
+                orig_dtype = None
+                for a in args:
+                    if isinstance(a, torch.Tensor) and a.is_floating_point():
+                        orig_dtype = a.dtype
+                        break
+                if orig_dtype is None:
+                    for v in kwargs.values():
+                        if isinstance(v, torch.Tensor) and v.is_floating_point():
+                            orig_dtype = v.dtype
+                            break
+                
+                if orig_dtype is not None:
+                    if isinstance(out, torch.Tensor) and out.is_floating_point():
+                        out = out.to(orig_dtype)
+                    elif isinstance(out, tuple):
+                        out = tuple(o.to(orig_dtype) if isinstance(o, torch.Tensor) and o.is_floating_point() else o for o in out)
+                return out
+            return wrapper
+
+        module.forward = make_wrapper(orig_forward, module)
+        module._is_fp32_patched = True
+        module.to(torch.float32)
+        
+    return model
