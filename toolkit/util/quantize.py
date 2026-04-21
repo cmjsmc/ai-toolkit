@@ -107,6 +107,8 @@ def quantize(
             continue
         if exclude is not None and any(fnmatch(name, pattern) for pattern in exclude):
             continue
+        if getattr(m, "_is_fp32_patched", False):
+            continue  # Skip our FP32 overflow protected layers
         try:
             # check if m is QLinear or QConv2d
             if m.__class__.__name__ in Q_MODULES:
