@@ -18,6 +18,9 @@ from toolkit.accelerator import unwrap_model
 from optimum.quanto import freeze, QTensor
 from toolkit.util.quantize import quantize, get_qtype, quantize_model
 
+import hashlib
+from toolkit.paths import MODELS_PATH
+
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
 from .src.model import Flux2, Flux2Params
 from .src.pipeline import Flux2Pipeline
@@ -133,39 +136,56 @@ class Flux2Model(BaseModel):
         transformer_path = model_path
 
         self.print_and_status_update("Loading transformer")
+        
+        # --- CACHE SETUP ---
+        cache_dir = os.path.join(MODELS_PATH, "quantized_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        q_hash_str = f"{model_path}_{self.model_config.qtype}_{self.model_config.quantize_kwargs}"
+        q_hash = hashlib.md5(q_hash_str.encode()).hexdigest()
+        transformer_cache_path = os.path.join(cache_dir, f"transformer_{q_hash}.pt")
+        # -------------------
+
+        # Initialize empty shell on meta device
         with torch.device("meta"):
             transformer = Flux2(self.get_flux2_params())
 
-        # use local path if provided
-        if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
-            transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
-
-        if not os.path.exists(transformer_path):
-            # assume it is from the hub
-            transformer_path = huggingface_hub.hf_hub_download(
-                repo_id=model_path,
-                filename=self.flux2_te_filename,
-                token=HF_TOKEN,
-            )
-
-        transformer_state_dict = load_file(transformer_path, device="cpu")
-        
-        # Load directly, delete the dict from RAM, then cast layer-by-layer
-        transformer.load_state_dict(transformer_state_dict, assign=True)
-        del transformer_state_dict
-        transformer.to(dtype)
-
-        if self.model_config.quantize:
-            # patch the state dict method
-            patch_dequantization_on_save(transformer)
-            # Avoid full-model peak VRAM allocation before quantization.
-            self.print_and_status_update("Keeping transformer on CPU for quantization")
-            self.print_and_status_update("Quantizing Transformer")
+        if self.model_config.quantize and os.path.exists(transformer_cache_path):
+            self.print_and_status_update("Loading CACHED quantized transformer")
+            # Prepare layers for quantization
             quantize_model(self, transformer)
+            
+            # Load quantized tensor subclasses (requires weights_only=False)
+            cached_sd = torch.load(transformer_cache_path, map_location="cpu", weights_only=False)
+            transformer.load_state_dict(cached_sd, assign=True)
+            del cached_sd
+            transformer.to(self.device_torch)
             flush()
         else:
-            transformer.to(self.device_torch, dtype=dtype)
-        flush()
+            # --- Standard loading ---
+            if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
+                transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
+            if not os.path.exists(transformer_path):
+                transformer_path = huggingface_hub.hf_hub_download(
+                    repo_id=model_path, filename=self.flux2_te_filename, token=HF_TOKEN
+                )
+
+            transformer_state_dict = load_file(transformer_path, device="cpu")
+            transformer.load_state_dict(transformer_state_dict, assign=True)
+            del transformer_state_dict
+            transformer.to(dtype)
+
+            if self.model_config.quantize:
+                self.print_and_status_update("Keeping transformer on CPU for quantization")
+                self.print_and_status_update("Quantizing Transformer")
+                quantize_model(self, transformer)
+                
+                # Save to cache for next time
+                self.print_and_status_update("Saving quantized transformer to cache...")
+                torch.save(transformer.state_dict(), transformer_cache_path)
+                
+            transformer.to(self.device_torch)
+            flush()
 
         if (
             self.model_config.layer_offloading
