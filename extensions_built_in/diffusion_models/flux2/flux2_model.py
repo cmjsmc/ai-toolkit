@@ -219,14 +219,46 @@ class Flux2Model(BaseModel):
         if self.model_config.quantize:
             # patch the state dict method
             patch_dequantization_on_save(transformer)
-            # Avoid full-model peak VRAM allocation before quantization.
             self.print_and_status_update("Keeping transformer on CPU for quantization")
             self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
+            
+            # 1. Setup exclusions for sensitive layers
+            quantize_kwargs = self.model_config.quantize_kwargs.copy()
+            if 'exclude' not in quantize_kwargs:
+                quantize_kwargs['exclude'] = []
+            
+            # Exclude sensitive layers so they don't get crushed to int8/fp8
+            quantize_kwargs['exclude'] += [
+                "*time_text_embed*", 
+                "*norm_out*", 
+                "*proj_out*", 
+                "*.norm1", 
+                "*.norm1_context", 
+                "*.norm"
+            ]
+
+            quantization_type = get_qtype(self.model_config.qtype)
+            
+            # 2. Block-by-block quantization to save RAM (respecting exclusions)
+            all_blocks = list(transformer.transformer_blocks) + list(transformer.single_transformer_blocks)
+            for block in tqdm(all_blocks, desc="Quantizing blocks"):
+                block.to(self.device_torch, dtype=dtype)
+                quantize(block, weights=quantization_type, **quantize_kwargs)
+                freeze(block)
+                block.to("cpu")
+            
+            # 3. Quantize the rest of the transformer
+            quantize(transformer, weights=quantization_type, **quantize_kwargs)
+            freeze(transformer)
+            
+            transformer.to(self.device_torch)
         else:
             transformer.to(self.device_torch, dtype=dtype)
+
         flush()
+
+        # 4. Apply the FP32 wrapper to the excluded sensitive layers
+        self.patch_sensitive_layers_to_fp32(transformer)
 
         if (
             self.model_config.layer_offloading
