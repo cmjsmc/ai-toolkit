@@ -43,6 +43,7 @@ class Flux2KleinModel(Flux2Model):
         text_encoder: Qwen3ForCausalLM = Qwen3ForCausalLM.from_pretrained(
             self.flux2_klein_te_path,
             torch_dtype=dtype,
+            low_cpu_mem_usage=True,
         )
         if self.model_config.quantize_te:
             self.print_and_status_update("Quantizing Qwen3")
