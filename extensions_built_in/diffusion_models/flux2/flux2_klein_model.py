@@ -35,24 +35,59 @@ class Flux2KleinModel(Flux2Model):
         self.use_old_lokr_format = False
 
     def load_te(self):
+        import hashlib
+        from toolkit.paths import MODELS_PATH
+
         if self.flux2_klein_te_path is None:
             raise ValueError("flux2_klein_te_path must be set for Flux2KleinModel")
+        
         dtype = self.torch_dtype
-        self.print_and_status_update("Loading Qwen3")
+        
+        # --- CACHE SETUP ---
+        cache_dir = os.path.join(MODELS_PATH, "quantized_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        te_hash_str = f"{self.flux2_klein_te_path}_{self.model_config.qtype_te}"
+        te_hash = hashlib.md5(te_hash_str.encode()).hexdigest()
+        te_cache_path = os.path.join(cache_dir, f"te_{te_hash}.pt")
+        # -------------------
 
-        text_encoder: Qwen3ForCausalLM = Qwen3ForCausalLM.from_pretrained(
-            self.flux2_klein_te_path,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Qwen3")
+        if self.model_config.quantize_te and os.path.exists(te_cache_path):
+            self.print_and_status_update("Loading CACHED quantized Qwen3")
+            
+            # Create shell on meta device to save RAM
+            with torch.device("meta"):
+                text_encoder = Qwen3ForCausalLM.from_pretrained(
+                    self.flux2_klein_te_path, torch_dtype=dtype
+                )
+                
+            # Prepare layers for quantization
             quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
-            freeze(text_encoder)
-            flush()
-        elif not self.model_config.low_vram:
+            
+            # Load quantized tensor subclasses
+            cached_sd = torch.load(te_cache_path, map_location="cpu", weights_only=False)
+            text_encoder.load_state_dict(cached_sd, assign=True)
+            del cached_sd
+        else:
+            self.print_and_status_update("Loading Qwen3")
+            text_encoder = Qwen3ForCausalLM.from_pretrained(
+                self.flux2_klein_te_path,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
+            
+            if self.model_config.quantize_te:
+                self.print_and_status_update("Quantizing Qwen3")
+                quantize(text_encoder, weights=get_qtype(self.model_config.qtype_te))
+                freeze(text_encoder)
+                
+                self.print_and_status_update("Saving quantized Qwen3 to cache...")
+                torch.save(text_encoder.state_dict(), te_cache_path)
+
+        if not self.model_config.low_vram and not self.model_config.quantize_te:
             text_encoder.to(self.device_torch, dtype=dtype)
-            flush()
+            
+        flush()
 
         if (
             self.model_config.layer_offloading
