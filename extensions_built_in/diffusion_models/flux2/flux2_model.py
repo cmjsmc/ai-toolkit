@@ -92,37 +92,55 @@ class Flux2Model(BaseModel):
         return Flux2Params()
 
     def patch_sensitive_layers_to_fp32(self, model):
-        """Forces normalization and positional embeddings to run in fp32 to prevent NaNs in fp16."""
+        """
+        Forces specific volatile layers (Embedders, AdaLN Modulations, LastLayer) 
+        to run in fp32 to prevent NaNs in fp16 due to variance squaring and SiLU spikes.
+        """
         if self.torch_dtype != torch.float16:
             return
 
         self.print_and_status_update(f"Patching sensitive layers in {model.__class__.__name__} to float32...")
+        
+        # Target suffixes mapped from original BFL codebase to Diffusers equivalents:
+        # 1. MLPEmbedders -> time_text_embed
+        # 2. Modulations -> .norm1, .norm1_context, .norm
+        # 3. LastLayer -> norm_out, proj_out
+        target_suffixes = (
+            "time_text_embed", 
+            ".norm1", 
+            ".norm1_context", 
+            ".norm", 
+            "norm_out", 
+            "proj_out"
+        )
+        
+        patched_prefixes = []
+
         for name, module in model.named_modules():
-            module_class_name = module.__class__.__name__.lower()
+            # Check if this module matches our target suffixes
+            is_target = any(name == t or name.endswith(t) for t in target_suffixes)
             
-            # Target Norms
-            is_norm = isinstance(module, (torch.nn.LayerNorm, torch.nn.GroupNorm)) or 'norm' in module_class_name
-            # Target RoPE or Timestep representations (e.g., creating sinusoidal beds)
-            is_rope_or_time = 'rope' in module_class_name or 'rotary' in module_class_name or 'timestep' in module_class_name
+            # Ensure we don't double-wrap children of already wrapped modules 
+            # (e.g., the linear inside the time_text_embed)
+            is_child_of_patched = any(name.startswith(p + ".") for p in patched_prefixes)
             
-            # EXCLUDE heavy layers that shouldn't be touched (Linear, Conv, Embedding)
-            is_heavy_layer = isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Embedding)) or 'linear' in module_class_name or 'conv' in module_class_name
-            
-            if (is_norm or is_rope_or_time) and not is_heavy_layer and len(list(module.children())) == 0:
-                # Upcast weights (if the module has any)
+            if is_target and not is_child_of_patched:
+                # 1. Cast the module's internal weights/parameters to fp32
                 module.to(torch.float32)
+                patched_prefixes.append(name)
                 
-                # Wrap the forward pass to handle mixed inputs/outputs
+                # 2. Wrap the forward pass
                 orig_forward = module.forward
+                
                 def make_fp32_forward(orig_fwd):
                     def fp32_forward(*args, **kwargs):
-                        # Upcast inputs to fp32
+                        # Upcast inputs to fp32 so the internal math (squaring/SiLU) doesn't overflow
                         new_args = [a.to(torch.float32) if isinstance(a, torch.Tensor) and a.is_floating_point() else a for a in args]
                         new_kwargs = {k: v.to(torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in kwargs.items()}
                         
                         out = orig_fwd(*new_args, **new_kwargs)
                         
-                        # Downcast outputs back to fp16 so the next Linear layer is happy
+                        # Downcast outputs back to fp16 so the heavy attention matrices stay in fp16
                         if isinstance(out, torch.Tensor) and out.is_floating_point():
                             return out.to(torch.float16)
                         if isinstance(out, tuple):
