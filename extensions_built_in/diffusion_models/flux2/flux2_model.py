@@ -93,35 +93,25 @@ class Flux2Model(BaseModel):
 
     def patch_sensitive_layers_to_fp32(self, model):
         """
-        Forces specific volatile layers (Embedders, AdaLN Modulations, LastLayer) 
-        to run in fp32 to prevent NaNs in fp16 due to variance squaring and SiLU spikes.
+        Forces specific volatile layers (MLPEmbedder, Modulation, LastLayer) 
+        to run in fp32 to prevent NaNs in fp16.
         """
         if self.torch_dtype != torch.float16:
             return
 
         self.print_and_status_update(f"Patching sensitive layers in {model.__class__.__name__} to float32...")
         
-        # Target suffixes mapped from original BFL codebase to Diffusers equivalents:
-        # 1. MLPEmbedders -> time_text_embed
-        # 2. Modulations -> .norm1, .norm1_context, .norm
-        # 3. LastLayer -> norm_out, proj_out
-        target_suffixes = (
-            "time_text_embed", 
-            ".norm1", 
-            ".norm1_context", 
-            ".norm", 
-            "norm_out", 
-            "proj_out"
-        )
-        
+        # We check class names to explicitly match the BFL native architecture
+        target_classes = ("MLPEmbedder", "Modulation", "SingleModulation", "LastLayer")
         patched_prefixes = []
 
         for name, module in model.named_modules():
-            # Check if this module matches our target suffixes
-            is_target = any(name == t or name.endswith(t) for t in target_suffixes)
+            module_class_name = module.__class__.__name__
+            
+            # Check if this module matches our target BFL classes
+            is_target = any(module_class_name == t for t in target_classes)
             
             # Ensure we don't double-wrap children of already wrapped modules 
-            # (e.g., the linear inside the time_text_embed)
             is_child_of_patched = any(name.startswith(p + ".") for p in patched_prefixes)
             
             if is_target and not is_child_of_patched:
@@ -227,20 +217,20 @@ class Flux2Model(BaseModel):
             if 'exclude' not in quantize_kwargs:
                 quantize_kwargs['exclude'] = []
             
-            # Exclude sensitive layers so they don't get crushed to int8/fp8
+            # Target BFL native layer names to protect them from quantization
             quantize_kwargs['exclude'] += [
-                "*time_text_embed*", 
-                "*norm_out*", 
-                "*proj_out*", 
-                "*.norm1", 
-                "*.norm1_context", 
-                "*.norm"
+                "*time_in*", 
+                "*guidance_in*", 
+                "*img_mod*", 
+                "*txt_mod*", 
+                "*modulation*", 
+                "*final_layer*"
             ]
 
             quantization_type = get_qtype(self.model_config.qtype)
             
-            # 2. Block-by-block quantization to save RAM (respecting exclusions)
-            all_blocks = list(transformer.transformer_blocks) + list(transformer.single_transformer_blocks)
+            # 2. Block-by-block quantization using BFL native block names
+            all_blocks = list(transformer.double_blocks) + list(transformer.single_blocks)
             for block in tqdm(all_blocks, desc="Quantizing blocks"):
                 block.to(self.device_torch, dtype=dtype)
                 quantize(block, weights=quantization_type, **quantize_kwargs)
