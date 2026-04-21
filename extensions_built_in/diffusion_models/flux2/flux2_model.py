@@ -91,6 +91,41 @@ class Flux2Model(BaseModel):
     def get_flux2_params(self):
         return Flux2Params()
 
+    def patch_sensitive_layers_to_fp32(self, model):
+        """Forces normalization and positional embeddings to run in fp32 to prevent NaNs in fp16."""
+        if self.torch_dtype != torch.float16:
+            return
+
+        self.print_and_status_update(f"Patching sensitive layers in {model.__class__.__name__} to float32...")
+        for name, module in model.named_modules():
+            # Target Norms and RoPE/Time embeddings
+            is_norm = isinstance(module, (torch.nn.LayerNorm, torch.nn.GroupNorm)) or 'norm' in module.__class__.__name__.lower()
+            is_rope = 'rope' in name.lower() or 'rotary' in name.lower() or 'time' in name.lower()
+            
+            if (is_norm or is_rope) and len(list(module.children())) == 0:
+                # Upcast weights
+                module.to(torch.float32)
+                
+                # Wrap the forward pass to handle mixed inputs/outputs
+                orig_forward = module.forward
+                def make_fp32_forward(orig_fwd):
+                    def fp32_forward(*args, **kwargs):
+                        # Upcast inputs to fp32
+                        new_args = [a.to(torch.float32) if isinstance(a, torch.Tensor) and a.is_floating_point() else a for a in args]
+                        new_kwargs = {k: v.to(torch.float32) if isinstance(v, torch.Tensor) and v.is_floating_point() else v for k, v in kwargs.items()}
+                        
+                        out = orig_fwd(*new_args, **new_kwargs)
+                        
+                        # Downcast outputs back to fp16
+                        if isinstance(out, torch.Tensor) and out.is_floating_point():
+                            return out.to(torch.float16)
+                        if isinstance(out, tuple):
+                            return tuple(o.to(torch.float16) if isinstance(o, torch.Tensor) and o.is_floating_point() else o for o in out)
+                        return out
+                    return fp32_forward
+                
+                module.forward = make_fp32_forward(orig_forward)
+
     def load_te(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Mistral")
@@ -154,6 +189,8 @@ class Flux2Model(BaseModel):
         transformer.load_state_dict(transformer_state_dict, assign=True)
         del transformer_state_dict
         transformer.to(dtype)
+
+        self.patch_sensitive_layers_to_fp32(transformer)
 
         if self.model_config.quantize:
             # patch the state dict method
@@ -430,14 +467,15 @@ class Flux2Model(BaseModel):
 
             cast_dtype = self.model.dtype
 
-        packed_noise_pred = self.transformer(
-            x=img_input.to(self.device_torch, cast_dtype),
-            x_ids=img_input_ids.to(self.device_torch),
-            timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
-            ctx=txt.to(self.device_torch, cast_dtype),
-            ctx_ids=txt_ids.to(self.device_torch),
-            guidance=guidance_vec.to(self.device_torch, cast_dtype),
-        )
+        with torch.autocast(device_type=self.device_torch.type, dtype=torch.float16 if self.torch_dtype == torch.float16 else torch.bfloat16):
+            packed_noise_pred = self.transformer(
+                x=img_input.to(self.device_torch, cast_dtype),
+                x_ids=img_input_ids.to(self.device_torch),
+                timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
+                ctx=txt.to(self.device_torch, cast_dtype),
+                ctx_ids=txt_ids.to(self.device_torch),
+                guidance=guidance_vec.to(self.device_torch, cast_dtype),
+            )
 
         if img_cond_seq is not None:
             packed_noise_pred = packed_noise_pred[:, : packed_latents.shape[1]]
