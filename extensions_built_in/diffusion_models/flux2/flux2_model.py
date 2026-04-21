@@ -99,6 +99,7 @@ class Flux2Model(BaseModel):
             Mistral3ForConditionalGeneration.from_pretrained(
                 MISTRAL_PATH,
                 torch_dtype=dtype,
+                low_cpu_mem_usage=True,
             )
         )
         text_encoder.to(self.device_torch, dtype=dtype)
@@ -148,12 +149,11 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
-
-        # cast to dtype
-        for key in transformer_state_dict:
-            transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
-
+        
+        # Load directly, delete the dict from RAM, then cast layer-by-layer
         transformer.load_state_dict(transformer_state_dict, assign=True)
+        del transformer_state_dict
+        transformer.to(dtype)
 
         if self.model_config.quantize:
             # patch the state dict method
@@ -204,12 +204,10 @@ class Flux2Model(BaseModel):
             vae = AutoEncoder(AutoEncoderParams())
 
         vae_state_dict = load_file(vae_path, device="cpu")
-
-        # cast to dtype
-        for key in vae_state_dict:
-            vae_state_dict[key] = vae_state_dict[key].to(dtype)
-
+        
         vae.load_state_dict(vae_state_dict, assign=True)
+        del vae_state_dict
+        vae.to(dtype)
 
         self.noise_scheduler = Flux2Model.get_train_scheduler()
 
