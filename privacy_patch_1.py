@@ -161,40 +161,6 @@ def setup_crypto_patches():
     except ImportError: pass
 
     try:
-        import av
-        _orig_av_open = av.open
-        def _patched_av_open(file, *args, **kwargs):
-            is_enc = False
-            if isinstance(file, str):
-                try:
-                    with open(file, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-                if is_enc:
-                    raw = read_decrypted_file(file)
-                    file = io.BytesIO(raw)
-            return _orig_av_open(file, *args, **kwargs)
-        av.open = _patched_av_open
-    except ImportError: pass
-
-    try:
-        import torchaudio
-        _orig_ta_load = torchaudio.load
-        def _patched_ta_load(uri, *args, **kwargs):
-            is_enc = False
-            if isinstance(uri, str):
-                try:
-                    with open(uri, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-                if is_enc:
-                    raw = read_decrypted_file(uri)
-                    uri = io.BytesIO(raw)
-            return _orig_ta_load(uri, *args, **kwargs)
-        torchaudio.load = _patched_ta_load
-    except ImportError: pass
-
-    try:
         from toolkit import image_utils
         import PIL.Image
         _orig_get_image_size = image_utils.get_image_size
@@ -210,54 +176,6 @@ def setup_crypto_patches():
                 return img.size
             return _orig_get_image_size(file_path)
         image_utils.get_image_size = _patched_get_image_size
-    except ImportError: pass
-    
-    try:
-        import transformers.video_utils
-        _orig_load_video = transformers.video_utils.load_video
-        def _patched_load_video(video_path, *args, **kwargs):
-            is_enc = False
-            if isinstance(video_path, str):
-                try:
-                    with open(video_path, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-            if is_enc:
-                import tempfile
-                raw = read_decrypted_file(video_path)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                    tmp.write(raw)
-                    tmp_path = tmp.name
-                try:
-                    return _orig_load_video(tmp_path, *args, **kwargs)
-                finally:
-                    os.remove(tmp_path)
-            return _orig_load_video(video_path, *args, **kwargs)
-        transformers.video_utils.load_video = _patched_load_video
-    except ImportError: pass
-
-    try:
-        import transformers.audio_utils
-        _orig_load_audio = transformers.audio_utils.load_audio
-        def _patched_load_audio(audio_path, *args, **kwargs):
-            is_enc = False
-            if isinstance(audio_path, str):
-                try:
-                    with open(audio_path, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-            if is_enc:
-                import tempfile
-                raw = read_decrypted_file(audio_path)
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    tmp.write(raw)
-                    tmp_path = tmp.name
-                try:
-                    return _orig_load_audio(tmp_path, *args, **kwargs)
-                finally:
-                    os.remove(tmp_path)
-            return _orig_load_audio(audio_path, *args, **kwargs)
-        transformers.audio_utils.load_audio = _patched_load_audio
     except ImportError: pass
 
 setup_crypto_patches()
@@ -1161,9 +1079,9 @@ def patch_file_if_contains(file_path: Path, search_text: str, replacement_text: 
     content = file_path.read_text(encoding="utf-8")
     
     # Normalize CRLF -> LF for safe multi-line matching
-    content_norm = content.replace('\\r\\n', '\\n')
-    search_norm = search_text.replace('\\r\\n', '\\n')
-    replacement_norm = replacement_text.replace('\\r\\n', '\\n')
+    content_norm = content.replace('\r\n', '\n')
+    search_norm = search_text.replace('\r\n', '\n')
+    replacement_norm = replacement_text.replace('\r\n', '\n')
     
     if replacement_norm in content_norm:
         print(f"  [-] Already patched: {file_path.name}")
@@ -1349,6 +1267,15 @@ def main():
     # 2.6 Patch extensions_built_in/captioner/BaseCaptioner.py (Save/Read encrypted caption files)
     p = target_dir / "extensions_built_in" / "captioner" / "BaseCaptioner.py"
     patch_file_if_contains(p,
+        search_text="""    def load_pil_image(self, file_path: str, max_res: Optional[int] = None) -> Image:
+        image = Image.open(file_path).convert("RGB")""",
+        replacement_text="""    def load_pil_image(self, file_path: str, max_res: Optional[int] = None) -> Image:
+        from toolkit.crypto import read_decrypted_file
+        import io
+        raw = read_decrypted_file(file_path)
+        image = Image.open(io.BytesIO(raw)).convert("RGB")""")
+
+    patch_file_if_contains(p,
         search_text='''        if os.path.exists(caption_file_path):
             os.remove(caption_file_path)
         with open(caption_file_path, "w", encoding="utf-8") as f:
@@ -1366,7 +1293,85 @@ def main():
                     from toolkit.crypto import read_decrypted_text
                     has_caption = read_decrypted_text(caption_file_path).strip() != ""''')
 
-    # 2.7 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
+    # 2.7 Patch extensions_built_in/captioner/Qwen3OmniCaptioner.py (Direct Decrypt for transformers)
+    p = target_dir / "extensions_built_in" / "captioner" / "Qwen3OmniCaptioner.py"
+    patch_file_if_contains(p,
+        search_text='''    def _prep_media(self, file_path: str):
+        """CPU side of one file, safe to run in a worker thread: decode +
+        subsample frames (or load the image), extract the audio track, render
+        the chat text. At batch size 1 the full processor (tokenize, resize,
+        mel) runs here too, so the main thread only moves tensors and
+        generates."""
+        if self._is_image_file(file_path):
+            from PIL import Image
+
+            image = Image.open(file_path).convert("RGB")
+            item = {"file": file_path, "kind": "image", "image": image, "audio": None}
+        else:
+            from transformers.video_utils import load_video
+            from transformers.audio_utils import load_audio
+
+            frames = load_video(file_path, fps=VIDEO_FPS)
+            if isinstance(frames, tuple):
+                frames = frames[0]
+            audio = None
+            try:
+                a = load_audio(file_path, sampling_rate=16000)
+                if a is not None and a.size > 0:
+                    audio = a
+            except Exception:
+                pass
+            item = {
+                "file": file_path,
+                "kind": "video_audio" if audio is not None else "video_silent",
+                "frames": frames,
+                "audio": audio,
+            }''',
+        replacement_text='''    def _prep_media(self, file_path: str):
+        """CPU side of one file, safe to run in a worker thread: decode +
+        subsample frames (or load the image), extract the audio track, render
+        the chat text. At batch size 1 the full processor (tokenize, resize,
+        mel) runs here too, so the main thread only moves tensors and
+        generates."""
+        from toolkit.crypto import read_decrypted_file
+        import io, os, tempfile
+        if self._is_image_file(file_path):
+            from PIL import Image
+            raw = read_decrypted_file(file_path)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            item = {"file": file_path, "kind": "image", "image": image, "audio": None}
+        else:
+            from transformers.video_utils import load_video
+            from transformers.audio_utils import load_audio
+
+            raw = read_decrypted_file(file_path)
+            ext = os.path.splitext(file_path)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+
+            try:
+                frames = load_video(tmp_path, fps=VIDEO_FPS)
+                if isinstance(frames, tuple):
+                    frames = frames[0]
+                audio = None
+                try:
+                    a = load_audio(tmp_path, sampling_rate=16000)
+                    if a is not None and a.size > 0:
+                        audio = a
+                except Exception:
+                    pass
+            finally:
+                os.remove(tmp_path)
+            
+            item = {
+                "file": file_path,
+                "kind": "video_audio" if audio is not None else "video_silent",
+                "frames": frames,
+                "audio": audio,
+            }''')
+
+    # 2.8 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
     p = target_dir / "toolkit" / "metadata.py"
     patch_file_if_contains(p,
         search_text='''    if add_software_info:
