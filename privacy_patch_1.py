@@ -1244,10 +1244,24 @@ def main():
     patch_file_if_contains(p,
         search_text="""            if os.path.exists(prompt_path):
                 with open(prompt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read()""",
+                    prompt = f.read()
+                    short_caption = None
+                    prompt = clean_caption(prompt)
+                    if short_caption is not None:
+                        short_caption = clean_caption(short_caption)
+                    
+                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                        prompt = self.dataset_config.default_caption""",
         replacement_text="""            if os.path.exists(prompt_path):
                 from toolkit.crypto import read_decrypted_text
-                prompt = read_decrypted_text(prompt_path)""")
+                prompt = read_decrypted_text(prompt_path)
+                short_caption = None
+                prompt = clean_caption(prompt)
+                if short_caption is not None:
+                    short_caption = clean_caption(short_caption)
+                
+                if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                        prompt = self.dataset_config.default_caption""")
 
     # 2.4 Patch extensions_built_in/sd_trainer/SDTrainer.py (Encrypted Negative Prompt files)
     p = target_dir / "extensions_built_in" / "sd_trainer" / "SDTrainer.py"
@@ -1256,13 +1270,15 @@ def main():
             if os.path.exists(self.train_config.negative_prompt):
                 with open(self.train_config.negative_prompt, 'r') as f:
                     self.negative_prompt_pool = f.readlines()
-                    # remove empty""",
+                    # remove empty
+                    self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]""",
         replacement_text="""        if self.train_config.negative_prompt is not None:
             if os.path.exists(self.train_config.negative_prompt):
                 from toolkit.crypto import read_decrypted_text
                 text = read_decrypted_text(self.train_config.negative_prompt)
                 self.negative_prompt_pool = text.splitlines()
-                # remove empty""")
+                # remove empty
+                self.negative_prompt_pool = [x.strip() for x in self.negative_prompt_pool if x.strip() != ""]""")
 
     # 2.5 Patch toolkit/data_loader.py (Encrypted JSON datasets configs)
     p = target_dir / "toolkit" / "data_loader.py"
@@ -1270,13 +1286,15 @@ def main():
         search_text="""            # assume json
             with open(self.dataset_path, 'r') as f:
                 self.caption_dict = json.load(f)
-                # keys are file paths""",
+                # keys are file paths
+                file_list = list(self.caption_dict.keys())""",
         replacement_text="""            # assume json
             from toolkit.crypto import read_decrypted_text
             import json
             text = read_decrypted_text(self.dataset_path)
             self.caption_dict = json.loads(text)
-            # keys are file paths""")
+            # keys are file paths
+            file_list = list(self.caption_dict.keys())""")
 
     # 2.6 Patch extensions_built_in/captioner/*.py (Write encrypted captions out of the box)
     captioners_dir = target_dir / "extensions_built_in" / "captioner"
