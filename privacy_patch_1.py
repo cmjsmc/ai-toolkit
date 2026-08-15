@@ -29,12 +29,29 @@ IV_SIZE = 12
 PBKDF2_ITERATIONS = 100000
 
 def get_encryption_password() -> Optional[str]:
+    # 1. Check environment variable first (for purely headless users)
     pwd = os.environ.get("AITK_ENCRYPTION_PASSWORD", None)
-    if pwd is not None:
-        pwd = pwd.strip()
-        if len(pwd) == 0:
-            pwd = None
-    return pwd
+    if pwd is not None and pwd.strip() != "":
+        return pwd.strip()
+    
+    # 2. Check SQLite Database directly to guarantee sync with UI
+    try:
+        import sqlite3
+        # aitk_db.db is located in the root of the repository
+        root_dir = os.path.dirname(os.path.dirname(__file__))
+        db_path = os.path.join(root_dir, "aitk_db.db")
+        if os.path.exists(db_path):
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM Settings WHERE key = 'ENCRYPTION_PASSWORD'")
+            row = cursor.fetchone()
+            conn.close()
+            if row is not None and row[0].strip() != "":
+                return row[0].strip()
+    except Exception:
+        pass
+        
+    return None
 
 def derive_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=PBKDF2_ITERATIONS)
@@ -62,21 +79,23 @@ def decrypt_bytes(data: bytes, password: Optional[str] = None) -> bytes:
         password = get_encryption_password()
     if password is None:
         raise ValueError("Encrypted content detected, but no password is set.")
+    
     offset = len(AITK_MAGIC_HEADER)
     salt = data[offset : offset + SALT_SIZE]
     offset += SALT_SIZE
     iv = data[offset : offset + IV_SIZE]
+    offset += IV_SIZE
     ciphertext = data[offset:]
+    
     key = derive_key(password, salt)
     aesgcm = AESGCM(key)
     try:
         return aesgcm.decrypt(iv, ciphertext, None)
     except Exception as e:
         raise ValueError(
-            "\\n\\n[!] DECRYPTION ERROR (InvalidTag): The file could not be decrypted. "
-            "This happens when the active AITK_ENCRYPTION_PASSWORD does not match the "
-            "password used to originally upload/encrypt this file. Please ensure the "
-            "password in Settings matches, or delete and re-upload the dataset.\\n"
+            "\\n\\n[!] AES-GCM DECRYPTION FAILED [!]\\n"
+            "The active encryption password does not match the key used to encrypt this file.\\n"
+            "Please ensure the password in Settings matches the original, or delete and re-upload the dataset.\\n"
         ) from e
 
 def read_decrypted_file(file_path: str, password: Optional[str] = None) -> bytes:
@@ -166,40 +185,6 @@ def setup_crypto_patches():
                 except Exception: pass
             return _orig_what(file, h)
         imghdr.what = _patched_what
-    except ImportError: pass
-
-    try:
-        import av
-        _orig_av_open = av.open
-        def _patched_av_open(file, *args, **kwargs):
-            is_enc = False
-            if isinstance(file, str):
-                try:
-                    with open(file, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-                if is_enc:
-                    raw = read_decrypted_file(file)
-                    file = io.BytesIO(raw)
-            return _orig_av_open(file, *args, **kwargs)
-        av.open = _patched_av_open
-    except ImportError: pass
-
-    try:
-        import torchaudio
-        _orig_ta_load = torchaudio.load
-        def _patched_ta_load(uri, *args, **kwargs):
-            is_enc = False
-            if isinstance(uri, str):
-                try:
-                    with open(uri, "rb") as f:
-                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
-                except Exception: pass
-                if is_enc:
-                    raw = read_decrypted_file(uri)
-                    uri = io.BytesIO(raw)
-            return _orig_ta_load(uri, *args, **kwargs)
-        torchaudio.load = _patched_ta_load
     except ImportError: pass
 
     try:
@@ -1382,7 +1367,85 @@ def main():
                     from toolkit.crypto import read_decrypted_text
                     has_caption = read_decrypted_text(caption_file_path).strip() != ""''')
 
-    # 2.7 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
+    # 2.7 Patch extensions_built_in/captioner/Qwen3OmniCaptioner.py (Direct Decrypt for transformers)
+    p = target_dir / "extensions_built_in" / "captioner" / "Qwen3OmniCaptioner.py"
+    patch_file_if_contains(p,
+        search_text='''    def _prep_media(self, file_path: str):
+        """CPU side of one file, safe to run in a worker thread: decode +
+        subsample frames (or load the image), extract the audio track, render
+        the chat text. At batch size 1 the full processor (tokenize, resize,
+        mel) runs here too, so the main thread only moves tensors and
+        generates."""
+        if self._is_image_file(file_path):
+            from PIL import Image
+
+            image = Image.open(file_path).convert("RGB")
+            item = {"file": file_path, "kind": "image", "image": image, "audio": None}
+        else:
+            from transformers.video_utils import load_video
+            from transformers.audio_utils import load_audio
+
+            frames = load_video(file_path, fps=VIDEO_FPS)
+            if isinstance(frames, tuple):
+                frames = frames[0]
+            audio = None
+            try:
+                a = load_audio(file_path, sampling_rate=16000)
+                if a is not None and a.size > 0:
+                    audio = a
+            except Exception:
+                pass
+            item = {
+                "file": file_path,
+                "kind": "video_audio" if audio is not None else "video_silent",
+                "frames": frames,
+                "audio": audio,
+            }''',
+        replacement_text='''    def _prep_media(self, file_path: str):
+        """CPU side of one file, safe to run in a worker thread: decode +
+        subsample frames (or load the image), extract the audio track, render
+        the chat text. At batch size 1 the full processor (tokenize, resize,
+        mel) runs here too, so the main thread only moves tensors and
+        generates."""
+        from toolkit.crypto import read_decrypted_file
+        import io, os, tempfile
+        if self._is_image_file(file_path):
+            from PIL import Image
+            raw = read_decrypted_file(file_path)
+            image = Image.open(io.BytesIO(raw)).convert("RGB")
+            item = {"file": file_path, "kind": "image", "image": image, "audio": None}
+        else:
+            from transformers.video_utils import load_video
+            from transformers.audio_utils import load_audio
+
+            raw = read_decrypted_file(file_path)
+            ext = os.path.splitext(file_path)[1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(raw)
+                tmp_path = tmp.name
+
+            try:
+                frames = load_video(tmp_path, fps=VIDEO_FPS)
+                if isinstance(frames, tuple):
+                    frames = frames[0]
+                audio = None
+                try:
+                    a = load_audio(tmp_path, sampling_rate=16000)
+                    if a is not None and a.size > 0:
+                        audio = a
+                except Exception:
+                    pass
+            finally:
+                os.remove(tmp_path)
+            
+            item = {
+                "file": file_path,
+                "kind": "video_audio" if audio is not None else "video_silent",
+                "frames": frames,
+                "audio": audio,
+            }''')
+
+    # 2.8 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
     p = target_dir / "toolkit" / "metadata.py"
     patch_file_if_contains(p,
         search_text='''    if add_software_info:
