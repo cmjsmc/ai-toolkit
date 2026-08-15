@@ -1332,7 +1332,6 @@ def main():
                 file_list = list(self.caption_dict.keys())""",
         replacement_text="""            # assume json
             from toolkit.crypto import read_decrypted_text
-            import json
             text = read_decrypted_text(self.dataset_path)
             self.caption_dict = json.loads(text)
             # keys are file paths
