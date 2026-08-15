@@ -3,8 +3,6 @@
 apply_privacy_patch.py
 
 The Complete All-In-One End-to-End Encryption & Privacy Patch for AI-Toolkit.
-Applies all frontend WebCrypto tools, React components, backend AES-GCM decryption,
-PyTorch monkey-patches, log redactors, and LoRA metadata sanitizers in a single run.
 """
 
 import os
@@ -212,6 +210,54 @@ def setup_crypto_patches():
                 return img.size
             return _orig_get_image_size(file_path)
         image_utils.get_image_size = _patched_get_image_size
+    except ImportError: pass
+    
+    try:
+        import transformers.video_utils
+        _orig_load_video = transformers.video_utils.load_video
+        def _patched_load_video(video_path, *args, **kwargs):
+            is_enc = False
+            if isinstance(video_path, str):
+                try:
+                    with open(video_path, "rb") as f:
+                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
+                except Exception: pass
+            if is_enc:
+                import tempfile
+                raw = read_decrypted_file(video_path)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                try:
+                    return _orig_load_video(tmp_path, *args, **kwargs)
+                finally:
+                    os.remove(tmp_path)
+            return _orig_load_video(video_path, *args, **kwargs)
+        transformers.video_utils.load_video = _patched_load_video
+    except ImportError: pass
+
+    try:
+        import transformers.audio_utils
+        _orig_load_audio = transformers.audio_utils.load_audio
+        def _patched_load_audio(audio_path, *args, **kwargs):
+            is_enc = False
+            if isinstance(audio_path, str):
+                try:
+                    with open(audio_path, "rb") as f:
+                        if f.read(11) == b"AITK_ENC_V1": is_enc = True
+                except Exception: pass
+            if is_enc:
+                import tempfile
+                raw = read_decrypted_file(audio_path)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                try:
+                    return _orig_load_audio(tmp_path, *args, **kwargs)
+                finally:
+                    os.remove(tmp_path)
+            return _orig_load_audio(audio_path, *args, **kwargs)
+        transformers.audio_utils.load_audio = _patched_load_audio
     except ImportError: pass
 
 setup_crypto_patches()
@@ -1022,7 +1068,6 @@ from toolkit.crypto import decrypt_bytes
 
 def get_job(config_path: Union[str, dict, OrderedDict], name=None):
     if isinstance(config_path, str):
-        # Read and decrypt the config file in memory if encrypted
         with open(config_path, "rb") as f:
             raw_bytes = f.read()
         decrypted_bytes = decrypt_bytes(raw_bytes)
@@ -1071,7 +1116,6 @@ from toolkit.crypto import get_encryption_password, sanitize_log_text
 def print_acc(*args, **kwargs):
     if get_accelerator().is_local_main_process:
         if get_encryption_password() is not None:
-            # Redact prompt-like lines from console output in privacy mode
             sanitized_args = []
             for a in args:
                 if isinstance(a, str): sanitized_args.append(a)
@@ -1088,7 +1132,7 @@ class Logger:
     def write(self, message):
         self.terminal.write(message)
         self.log.write(message)
-        self.log.flush()  # Make sure it's written immediately
+        self.log.flush()
 
     def flush(self):
         self.terminal.flush()
@@ -1101,7 +1145,6 @@ def setup_log_to_file(filename):
     if get_accelerator().is_local_main_process:
         if not os.path.exists(os.path.dirname(filename)):
             os.makedirs(os.path.dirname(filename))
-    # Capture the real streams before replacing them
     log_file = open(filename, 'a')
     sys.stdout = Logger(sys.stdout, log_file)
     sys.stderr = Logger(sys.stderr, log_file)
@@ -1168,7 +1211,7 @@ def main():
             p.write_text(content, encoding="utf-8")
             print(f"  [+] Injected crypto initialization into: {p.name}")
 
-    # 2.2 Patch toolkit/data_transfer_object/data_loader.py (Spoof cv2 so it falls back safely to PyAV)
+    # 2.2 Patch toolkit/data_transfer_object/data_loader.py (Spoof cv2)
     p = target_dir / "toolkit" / "data_transfer_object" / "data_loader.py"
     patch_file_if_contains(p,
         search_text="""            else:
@@ -1296,18 +1339,28 @@ def main():
             # keys are file paths
             file_list = list(self.caption_dict.keys())""")
 
-    # 2.6 Patch extensions_built_in/captioner/*.py (Write encrypted captions out of the box)
-    captioners_dir = target_dir / "extensions_built_in" / "captioner"
-    if captioners_dir.exists():
-        for cap_file in captioners_dir.glob("*.py"):
-            content = cap_file.read_text(encoding="utf-8")
-            if 'with open(caption_path, "w", encoding="utf-8") as f:\n            f.write(caption)' in content:
-                content = content.replace(
-                    '        with open(caption_path, "w", encoding="utf-8") as f:\n            f.write(caption)',
-                    '        from toolkit.crypto import write_encrypted_text\n        write_encrypted_text(caption_path, caption)'
-                )
-                cap_file.write_text(content, encoding="utf-8")
-                print(f"  [+] Patched Python Auto-Captioner: {cap_file.name}")
+    # 2.6 Patch extensions_built_in/captioner/BaseCaptioner.py (Save/Read encrypted caption files)
+    p = target_dir / "extensions_built_in" / "captioner" / "BaseCaptioner.py"
+    patch_file_if_contains(p,
+        search_text="""        # delete it if it already exists
+        if os.path.exists(caption_file_path):
+            os.remove(caption_file_path)
+        with open(caption_file_path, "w", encoding="utf-8") as f:
+            f.write(caption)""",
+        replacement_text="""        # delete it if it already exists
+        if os.path.exists(caption_file_path):
+            os.remove(caption_file_path)
+        from toolkit.crypto import write_encrypted_text
+        write_encrypted_text(caption_file_path, caption)""")
+
+    patch_file_if_contains(p,
+        search_text="""                if os.path.exists(caption_file_path):
+                    with open(caption_file_path, "r", encoding="utf-8") as f:
+                        has_caption = f.read().strip() != "" """,
+        replacement_text="""                if os.path.exists(caption_file_path):
+                    from toolkit.crypto import read_decrypted_text
+                    has_caption = read_decrypted_text(caption_file_path).strip() != "" """)
+
 
     # 2.7 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
     p = target_dir / "toolkit" / "metadata.py"
