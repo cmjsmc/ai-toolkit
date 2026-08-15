@@ -1151,7 +1151,7 @@ def setup_log_to_file(filename):
 '''
 
 # ==============================================================================
-# Robust String Replacement Helper
+# Robust CRLF-normalized String Replacement Helper
 # ==============================================================================
 
 def patch_file_if_contains(file_path: Path, search_text: str, replacement_text: str):
@@ -1159,13 +1159,20 @@ def patch_file_if_contains(file_path: Path, search_text: str, replacement_text: 
         print(f"  [!] Skipped {file_path.name} (File not found)")
         return False
     content = file_path.read_text(encoding="utf-8")
-    if replacement_text in content:
+    
+    # Normalize CRLF -> LF for safe multi-line matching
+    content_norm = content.replace('\\r\\n', '\\n')
+    search_norm = search_text.replace('\\r\\n', '\\n')
+    replacement_norm = replacement_text.replace('\\r\\n', '\\n')
+    
+    if replacement_norm in content_norm:
         print(f"  [-] Already patched: {file_path.name}")
         return True
-    if search_text not in content:
+    if search_norm not in content_norm:
         print(f"  [!] Pattern not matched in {file_path.name}. Needs manual review.")
         return False
-    new_content = content.replace(search_text, replacement_text, 1)
+        
+    new_content = content_norm.replace(search_norm, replacement_norm, 1)
     file_path.write_text(new_content, encoding="utf-8")
     print(f"  [+] Patched string in: {file_path.name}")
     return True
@@ -1342,34 +1349,30 @@ def main():
     # 2.6 Patch extensions_built_in/captioner/BaseCaptioner.py (Save/Read encrypted caption files)
     p = target_dir / "extensions_built_in" / "captioner" / "BaseCaptioner.py"
     patch_file_if_contains(p,
-        search_text="""        # delete it if it already exists
-        if os.path.exists(caption_file_path):
+        search_text='''        if os.path.exists(caption_file_path):
             os.remove(caption_file_path)
         with open(caption_file_path, "w", encoding="utf-8") as f:
-            f.write(caption)""",
-        replacement_text="""        # delete it if it already exists
-        if os.path.exists(caption_file_path):
+            f.write(caption)''',
+        replacement_text='''        if os.path.exists(caption_file_path):
             os.remove(caption_file_path)
         from toolkit.crypto import write_encrypted_text
-        write_encrypted_text(caption_file_path, caption)""")
+        write_encrypted_text(caption_file_path, caption)''')
 
     patch_file_if_contains(p,
-        search_text="""                if os.path.exists(caption_file_path):
+        search_text='''                if os.path.exists(caption_file_path):
                     with open(caption_file_path, "r", encoding="utf-8") as f:
-                        has_caption = f.read().strip() != "" """,
-        replacement_text="""                if os.path.exists(caption_file_path):
+                        has_caption = f.read().strip() != ""''',
+        replacement_text='''                if os.path.exists(caption_file_path):
                     from toolkit.crypto import read_decrypted_text
-                    has_caption = read_decrypted_text(caption_file_path).strip() != "" """)
-
+                    has_caption = read_decrypted_text(caption_file_path).strip() != ""''')
 
     # 2.7 Patch toolkit/metadata.py (Sanitize LoRA output metadata)
     p = target_dir / "toolkit" / "metadata.py"
     patch_file_if_contains(p,
-        search_text="""    if add_software_info:
+        search_text='''    if add_software_info:
         save_meta["software"] = software_meta
-
-    # safetensors can only be one level deep""",
-        replacement_text="""    if add_software_info:
+    # safetensors can only be one level deep''',
+        replacement_text='''    if add_software_info:
         save_meta["software"] = software_meta
 
     sensitive_keys = ["ss_tag_frequency", "instance_prompt", "caption", "prompt", "training_info"]
@@ -1377,7 +1380,7 @@ def main():
         if any(sk in k.lower() for sk in sensitive_keys):
             del save_meta[k]
 
-    # safetensors can only be one level deep""")
+    # safetensors can only be one level deep''')
 
     # ---------------------------------------------------------
     # 3. Patch Existing Frontend Next.js API Logic
